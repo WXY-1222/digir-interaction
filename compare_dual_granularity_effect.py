@@ -321,11 +321,19 @@ def render_compare_figure(
 
 
 def main():
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    default_digir_root = os.environ.get("DIGIR_ROOT", os.path.join(script_dir, "digir"))
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--data", type=str, required=True)
     parser.add_argument("--ckpt_full", type=str, required=True, help="Checkpoint with full dual-granularity model.")
     parser.add_argument("--ckpt_ablate", type=str, required=True, help="Checkpoint with ablation model.")
-    parser.add_argument("--digir_root", type=str, default=r"C:\Users\Admin\Desktop\DIGIR")
+    parser.add_argument(
+        "--digir_root",
+        type=str,
+        default=default_digir_root,
+        help="Path to DIGIR code root. Defaults to <interaction>/digir or DIGIR_ROOT env.",
+    )
     parser.add_argument("--split", type=str, default="val", choices=["train", "val"])
     parser.add_argument("--idx", type=int, default=0)
     parser.add_argument(

@@ -42,8 +42,16 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-# Point to DIGIR repo
-sys.path.insert(0, r"C:\Users\Admin\Desktop\DIGIR")
+# Default DIGIR root: <interaction>/digir (or DIGIR_ROOT env override).
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_DIGIR_ROOT = os.environ.get("DIGIR_ROOT", os.path.join(PROJECT_ROOT, "digir"))
+if not os.path.exists(DEFAULT_DIGIR_ROOT):
+    raise FileNotFoundError(
+        f"DIGIR root not found: {DEFAULT_DIGIR_ROOT}. "
+        "Put digir.py at <interaction>/digir/models/digir.py or set DIGIR_ROOT."
+    )
+if DEFAULT_DIGIR_ROOT not in sys.path:
+    sys.path.insert(0, DEFAULT_DIGIR_ROOT)
 
 from models.digir import DIGIR  # noqa: E402
 from interaction_dataset_for_digir import InteractionDatasetForDIGIR, collate_fn  # noqa: E402

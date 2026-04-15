@@ -3,14 +3,12 @@ set -euo pipefail
 
 # Example:
 # CODE_ROOT=/workspace/interaction \
-# DIGIR_ROOT=/workspace/DIGIR \
 # DATA_ROOT=/data/interaction \
 # RUNS_ROOT=/data/interaction_runs \
 # GPUS=8 \
 # bash scripts/run_gate_sweep.sh
 
 CODE_ROOT="${CODE_ROOT:-/path/to/interaction}"
-DIGIR_ROOT="${DIGIR_ROOT:-/path/to/DIGIR}"
 DATA_ROOT="${DATA_ROOT:-/path/to/interaction_data}"
 RUNS_ROOT="${RUNS_ROOT:-/path/to/interaction_runs}"
 DATA_FILE="${DATA_FILE:-interaction_digir_all_12loc_h8_f12.pkl}"
@@ -23,7 +21,6 @@ cd "${CODE_ROOT}"
 for r in "${RATIOS[@]}"; do
   echo "=== Running gate_fixed_ratio=${r} ==="
   torchrun --standalone --nproc_per_node="${GPUS}" train_digir_full.py \
-    --digir_root "${DIGIR_ROOT}" \
     --data_root "${DATA_ROOT}" \
     --save_root "${RUNS_ROOT}" \
     --data "${DATA_FILE}" \

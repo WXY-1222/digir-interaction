@@ -889,12 +889,16 @@ def train_epoch(
 
 
 def main():
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    default_digir_root = os.environ.get("DIGIR_ROOT", os.path.join(script_dir, "digir"))
+
     parser = argparse.ArgumentParser(description="Train DIGIR (scheme 2A multi-map ready)")
     parser.add_argument(
         "--digir_root",
         type=str,
-        default=os.environ.get("DIGIR_ROOT", ""),
-        help="Path to DIGIR code root (contains models/digir.py). Also supports DIGIR_ROOT env.",
+        default=default_digir_root,
+        help="Path to DIGIR code root (contains models/digir.py). "
+        "Defaults to <interaction>/digir, or DIGIR_ROOT env if set.",
     )
     parser.add_argument(
         "--data_root",

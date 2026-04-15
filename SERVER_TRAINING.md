@@ -4,7 +4,8 @@
 
 - Multi-GPU training with `torchrun` (DDP, for example 8x A100).
 - Multi-GPU evaluation aggregation in DDP (full validation is sharded across GPUs, then merged).
-- Code/data/output path separation via `--digir_root`, `--data_root`, and `--save_root`.
+- Code/data/output path separation via `--data_root` and `--save_root`.
+- DIGIR model code defaults to `<interaction>/digir/models/digir.py` (override with `--digir_root` only if needed).
 
 ## 1) 8-GPU command (equivalent to your local command)
 
@@ -12,7 +13,6 @@
 cd /path/to/interaction
 
 torchrun --standalone --nproc_per_node=8 train_digir_full.py \
-  --digir_root /path/to/DIGIR \
   --data_root /path/to/interaction_data \
   --save_root /path/to/interaction_runs \
   --data interaction_digir_all_12loc_h8_f12.pkl \
@@ -48,7 +48,6 @@ cd /path/to/interaction
 
 for r in 0.0 0.2 0.4 0.6 0.8 1.0; do
   torchrun --standalone --nproc_per_node=8 train_digir_full.py \
-    --digir_root /path/to/DIGIR \
     --data_root /path/to/interaction_data \
     --save_root /path/to/interaction_runs \
     --data interaction_digir_all_12loc_h8_f12.pkl \

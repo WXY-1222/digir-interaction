@@ -9,7 +9,15 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 import numpy as np
 
-sys.path.insert(0, 'C:\\Users\\Admin\\Desktop\\DIGIR')
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_DIGIR_ROOT = os.environ.get("DIGIR_ROOT", os.path.join(PROJECT_ROOT, "digir"))
+if not os.path.exists(DEFAULT_DIGIR_ROOT):
+    raise FileNotFoundError(
+        f"DIGIR root not found: {DEFAULT_DIGIR_ROOT}. "
+        "Put digir.py at <interaction>/digir/models/digir.py or set DIGIR_ROOT."
+    )
+if DEFAULT_DIGIR_ROOT not in sys.path:
+    sys.path.insert(0, DEFAULT_DIGIR_ROOT)
 
 from models.digir import DIGIR
 from interaction_dataset_for_digir import InteractionDatasetForDIGIR, collate_fn

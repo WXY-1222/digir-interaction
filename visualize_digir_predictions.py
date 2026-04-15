@@ -421,14 +421,18 @@ def animate_scene(
 
 
 def main():
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    default_digir_root = os.environ.get("DIGIR_ROOT", os.path.join(script_dir, "digir"))
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--data", type=str, default="./digir_data/interaction_digir.pkl")
     parser.add_argument("--ckpt", type=str, default="./digir_interaction_best.pt")
     parser.add_argument(
         "--digir_root",
         type=str,
-        default=os.environ.get("DIGIR_ROOT", r"C:\Users\Admin\Desktop\DIGIR"),
-        help="Path to DIGIR repo root (contains models/). Can also set env DIGIR_ROOT.",
+        default=default_digir_root,
+        help="Path to DIGIR repo root (contains models/). "
+        "Defaults to <interaction>/digir, or DIGIR_ROOT env.",
     )
     parser.add_argument("--split", type=str, default="val", choices=["train", "val"])
     parser.add_argument(
