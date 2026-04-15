@@ -11,20 +11,92 @@ Metrics:
 """
 import sys
 import os
+import math
 import torch
 import torch.optim as optim
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 from tqdm import tqdm
 import numpy as np
 import argparse
 import random
 from collections import defaultdict
 
-sys.path.insert(0, 'C:\\Users\\Admin\\Desktop\\DIGIR')
-
-from models.digir import DIGIR
 from interaction_dataset_for_digir import InteractionDatasetForDIGIR, collate_fn
 from digir_coord_utils import COORD_PER_AGENT, COORD_SCENE, future_local_from_normed, normalize_batch_for_digir
+
+
+def import_digir_model(digir_root: str):
+    """Dynamically import DIGIR from a configurable code path."""
+    if digir_root:
+        digir_root = os.path.abspath(os.path.expanduser(digir_root))
+        if digir_root not in sys.path:
+            sys.path.insert(0, digir_root)
+    try:
+        from models.digir import DIGIR
+    except Exception as exc:
+        hint = (
+            "Cannot import `models.digir`. "
+            "Set --digir_root (or DIGIR_ROOT env) to your DIGIR code directory."
+        )
+        raise RuntimeError(hint) from exc
+    return DIGIR
+
+
+def resolve_rooted_path(path_value: str, root: str = "") -> str:
+    """Resolve path_value under root when path_value is relative."""
+    expanded = os.path.expanduser(path_value)
+    if os.path.isabs(expanded):
+        return os.path.abspath(expanded)
+    if root:
+        return os.path.abspath(os.path.join(os.path.expanduser(root), expanded))
+    return os.path.abspath(expanded)
+
+
+def setup_distributed(dist_backend: str = "nccl"):
+    """Initialize distributed state from torchrun env vars."""
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    is_distributed = world_size > 1
+
+    if is_distributed:
+        if not torch.cuda.is_available():
+            raise RuntimeError("Distributed training requires CUDA GPUs.")
+        torch.cuda.set_device(local_rank)
+        dist.init_process_group(backend=dist_backend, init_method="env://")
+
+    return is_distributed, rank, local_rank, world_size
+
+
+def cleanup_distributed():
+    if dist.is_available() and dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def unwrap_model(model):
+    return model.module if hasattr(model, "module") else model
+
+
+def reduce_mean_scalar(value: float, device: torch.device, is_distributed: bool) -> float:
+    if not is_distributed:
+        return float(value)
+    t = torch.tensor([float(value)], dtype=torch.float64, device=device)
+    dist.all_reduce(t, op=dist.ReduceOp.SUM)
+    return float((t / dist.get_world_size()).item())
+
+
+def reduce_mean_dict(stats: dict, device: torch.device, is_distributed: bool):
+    if stats is None:
+        return None
+    if not is_distributed:
+        return stats
+    reduced = {}
+    for k, v in stats.items():
+        reduced[k] = reduce_mean_scalar(float(v), device, is_distributed=True)
+    return reduced
 
 
 class LocationBatchSampler:
@@ -38,6 +110,7 @@ class LocationBatchSampler:
         self.shuffle = shuffle
         self.drop_last = drop_last
         self.seed = seed
+        self.epoch = 0
 
         # Resolve location list for indices in this dataset-like object
         locations = None
@@ -58,7 +131,7 @@ class LocationBatchSampler:
         self.groups = dict(groups)
 
     def __iter__(self):
-        rng = random.Random(self.seed)
+        rng = random.Random(self.seed + self.epoch)
         loc_keys = list(self.groups.keys())
         if self.shuffle:
             rng.shuffle(loc_keys)
@@ -73,6 +146,9 @@ class LocationBatchSampler:
                     continue
                 yield batch
 
+    def set_epoch(self, epoch: int):
+        self.epoch = int(epoch)
+
     def __len__(self):
         n = 0
         for indices in self.groups.values():
@@ -81,6 +157,76 @@ class LocationBatchSampler:
             else:
                 n += (len(indices) + self.batch_size - 1) // self.batch_size
         return n
+
+
+class DistributedLocationBatchSampler:
+    """
+    DDP-compatible sampler for scheme 2A location-grouped batches.
+    It first builds all location-homogeneous batches, then shards by rank.
+    """
+    def __init__(
+        self,
+        dataset,
+        batch_size,
+        num_replicas,
+        rank,
+        shuffle=True,
+        drop_last=False,
+        seed=42,
+    ):
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.num_replicas = int(num_replicas)
+        self.rank = int(rank)
+        self.shuffle = shuffle
+        self.drop_last = drop_last
+        self.seed = seed
+        self.epoch = 0
+
+    def set_epoch(self, epoch: int):
+        self.epoch = int(epoch)
+
+    def _build_all_batches(self):
+        base = LocationBatchSampler(
+            self.dataset,
+            batch_size=self.batch_size,
+            shuffle=self.shuffle,
+            drop_last=self.drop_last,
+            seed=self.seed,
+        )
+        base.set_epoch(self.epoch)
+        return list(iter(base))
+
+    def __iter__(self):
+        all_batches = self._build_all_batches()
+        if len(all_batches) == 0:
+            return iter([])
+
+        if self.drop_last:
+            total_size = (len(all_batches) // self.num_replicas) * self.num_replicas
+            all_batches = all_batches[:total_size]
+        else:
+            total_size = int(math.ceil(len(all_batches) / self.num_replicas)) * self.num_replicas
+            pad = total_size - len(all_batches)
+            if pad > 0:
+                all_batches += all_batches[:pad]
+
+        rank_batches = all_batches[self.rank:total_size:self.num_replicas]
+        return iter(rank_batches)
+
+    def __len__(self):
+        base_len = len(
+            LocationBatchSampler(
+                self.dataset,
+                batch_size=self.batch_size,
+                shuffle=self.shuffle,
+                drop_last=self.drop_last,
+                seed=self.seed,
+            )
+        )
+        if self.drop_last:
+            return base_len // self.num_replicas
+        return int(math.ceil(base_len / self.num_replicas))
 
 
 def compute_min_ade_fde(pred_trajs, gt_traj):
@@ -313,11 +459,13 @@ def evaluate(
     max_batches=20,
     coord_frame=COORD_PER_AGENT,
     log_gate_stats=False,
+    show_progress=True,
 ):
     """
     Full evaluation with all paper metrics
     """
-    model.eval()
+    base_model = unwrap_model(model)
+    base_model.eval()
 
     all_min_ade = []
     all_min_fde = []
@@ -359,7 +507,12 @@ def evaluate(
     # max_batches <= 0 means evaluate the full dataloader
     use_max = max_batches if (max_batches is not None and max_batches > 0) else len(dataloader)
 
-    for batch in tqdm(dataloader, desc="Evaluating", total=min(use_max, len(dataloader))):
+    for batch in tqdm(
+        dataloader,
+        desc="Evaluating",
+        total=min(use_max, len(dataloader)),
+        disable=(not show_progress),
+    ):
         if batch_count >= use_max:
             break
         batch_count += 1
@@ -418,7 +571,7 @@ def evaluate(
         # ===== 1. Generate K samples for minADE/minFDE =====
         pred_trajs_k = []
         for _ in range(num_samples):
-            pred = model.generate(
+            pred = base_model.generate(
                 trajectories_norm, kg_data,
                 num_points=12,
                 num_samples=1,
@@ -453,7 +606,7 @@ def evaluate(
             per_loc[loc_name]['MissRate'].append(miss_rate)
 
         # ===== 2. Intent Accuracy =====
-        outputs = model(trajectories_norm, kg_data, mode='eval')
+        outputs = base_model(trajectories_norm, kg_data, mode='eval')
         intent_logits = outputs['intent_logits']  # (B, N, num_classes)
         intent_pred = intent_logits.argmax(dim=-1)  # (B, N)
         if log_gate_stats and 'gate_weights' in outputs:
@@ -528,8 +681,17 @@ def evaluate(
     return metrics
 
 
-def train_epoch(model, dataloader, optimizer, device, coord_frame=COORD_PER_AGENT, log_gate_stats=False):
+def train_epoch(
+    model,
+    dataloader,
+    optimizer,
+    device,
+    coord_frame=COORD_PER_AGENT,
+    log_gate_stats=False,
+    show_progress=True,
+):
     """Training epoch"""
+    base_model = unwrap_model(model)
     model.train()
     total_loss = 0
     effective_batches = 0
@@ -537,7 +699,7 @@ def train_epoch(model, dataloader, optimizer, device, coord_frame=COORD_PER_AGEN
     gate_means = []
     gate_stds = []
 
-    pbar = tqdm(dataloader, desc="Training")
+    pbar = tqdm(dataloader, desc="Training", disable=(not show_progress))
     for batch in pbar:
         trajectories = batch['trajectories'].to(device)
         future_traj = batch['future_trajectory'].to(device)
@@ -605,7 +767,7 @@ def train_epoch(model, dataloader, optimizer, device, coord_frame=COORD_PER_AGEN
             optimizer.zero_grad()
             continue
 
-        losses, loss = model.compute_losses(outputs, future_local, intent_labels, vehicle_masks)
+        losses, loss = base_model.compute_losses(outputs, future_local, intent_labels, vehicle_masks)
         if not torch.isfinite(loss).item():
             if printed_nan < 10:
                 printed_nan += 1
@@ -651,10 +813,29 @@ def train_epoch(model, dataloader, optimizer, device, coord_frame=COORD_PER_AGEN
 
 def main():
     parser = argparse.ArgumentParser(description="Train DIGIR (scheme 2A multi-map ready)")
+    parser.add_argument(
+        "--digir_root",
+        type=str,
+        default=os.environ.get("DIGIR_ROOT", ""),
+        help="Path to DIGIR code root (contains models/digir.py). Also supports DIGIR_ROOT env.",
+    )
+    parser.add_argument(
+        "--data_root",
+        type=str,
+        default=os.environ.get("INTERACTION_DATA_ROOT", ""),
+        help="Optional root directory for --data when --data is relative.",
+    )
+    parser.add_argument(
+        "--save_root",
+        type=str,
+        default=os.environ.get("INTERACTION_RUNS_ROOT", ""),
+        help="Optional root directory for --save when --save is relative.",
+    )
     parser.add_argument("--data", type=str, default="./digir_data/interaction_digir.pkl")
     parser.add_argument("--save", type=str, default="./digir_interaction_best.pt")
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument("--num_workers", type=int, default=4, help="DataLoader worker processes per rank.")
     parser.add_argument("--batch_by_location", action="store_true", help="Scheme 2A: group batches by location_name")
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
@@ -696,186 +877,308 @@ def main():
         help="per_agent: each vehicle centered at its last obs (default). "
         "scene: one origin per batch (first valid vehicle); KG shifted to match trajectories.",
     )
+    parser.add_argument(
+        "--dist_backend",
+        type=str,
+        default="nccl",
+        choices=["nccl", "gloo"],
+        help="Distributed backend for torchrun multi-GPU.",
+    )
     args = parser.parse_args()
 
-    save_dir = os.path.dirname(os.path.abspath(args.save))
-    if save_dir:
-        os.makedirs(save_dir, exist_ok=True)
+    args.data = resolve_rooted_path(args.data, args.data_root)
+    args.save = resolve_rooted_path(args.save, args.save_root)
 
-    # Reproducibility
-    random.seed(args.seed)
-    np.random.seed(args.seed)
-    torch.manual_seed(args.seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(args.seed)
+    DIGIR = import_digir_model(args.digir_root)
+    is_distributed, rank, local_rank, world_size = setup_distributed(args.dist_backend)
+    is_main = (rank == 0)
 
-    config = {
-        'd_model': 128,
-        'd_prior': 128,
-        'hist_len': 8,
-        'prediction_horizon': 12,
-        'num_intent_classes': 4,
-        'num_facility_types': 10,
-        'traj_enc_layers': 3,
-        'graph_enc_layers': 3,
-        'scene_tf_layers': 3,
-        'v2v_layers': 3,
-        'diffusion_tf_layers': 3,
-        'num_heads': 4,
-        'dropout': 0.1,
-        'elementwise_gate': True,
-        'diffusion_steps': 50,
-        'beta_1': 1e-4,
-        'beta_T': 5e-2,
-        'lambda_fine': 1.0,
-        'lambda_coarse': 0.5,
-        'lambda_cross': 0.1,
-        # Rule loss weight (L_col + L_map). Distances are in meters.
-        'lambda_rule': float(args.lambda_rule),
-        # Map margin (meters) for L_map (distance to road segment beyond this is penalized)
-        'map_margin': float(args.map_margin),
-        'coord_frame': str(args.coord_frame),
-        'ablate_cross_attn': bool(args.ablate_cross_attn),
-        'ablate_gate': str(args.ablate_gate),
-        'gate_fixed_ratio': (None if args.gate_fixed_ratio is None else float(args.gate_fixed_ratio)),
-    }
+    def mprint(*values, **kwargs):
+        if is_main:
+            print(*values, **kwargs)
 
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Device: {device}")
-    print(f"Model config: d_model={config['d_model']}, diffusion_steps={config['diffusion_steps']}")
-    print(f"Coordinate frame: {args.coord_frame}")
-    print(f"Ablate cross-attn: {args.ablate_cross_attn}")
-    print(f"Ablate gate: {args.ablate_gate}")
-    if args.gate_fixed_ratio is not None:
-        r = float(max(0.0, min(1.0, float(args.gate_fixed_ratio))))
-        print(f"Gate fixed ratio: {r:.3f} (interaction={r:.3f}, intent={1.0-r:.3f})")
+    try:
+        save_dir = os.path.dirname(os.path.abspath(args.save))
+        if save_dir:
+            os.makedirs(save_dir, exist_ok=True)
 
-    # Load data
-    data_path = args.data
-    if not os.path.exists(data_path):
-        print(f"Error: Data not found at {data_path}")
-        return
+        # Reproducibility
+        random.seed(args.seed)
+        np.random.seed(args.seed)
+        torch.manual_seed(args.seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(args.seed)
 
-    train_dataset = InteractionDatasetForDIGIR(data_path, split='train', max_vehicles=10)
-    val_dataset = InteractionDatasetForDIGIR(data_path, split='val', max_vehicles=10)
+        config = {
+            'd_model': 128,
+            'd_prior': 128,
+            'hist_len': 8,
+            'prediction_horizon': 12,
+            'num_intent_classes': 4,
+            'num_facility_types': 10,
+            'traj_enc_layers': 3,
+            'graph_enc_layers': 3,
+            'scene_tf_layers': 3,
+            'v2v_layers': 3,
+            'diffusion_tf_layers': 3,
+            'num_heads': 4,
+            'dropout': 0.1,
+            'elementwise_gate': True,
+            'diffusion_steps': 50,
+            'beta_1': 1e-4,
+            'beta_T': 5e-2,
+            'lambda_fine': 1.0,
+            'lambda_coarse': 0.5,
+            'lambda_cross': 0.1,
+            # Rule loss weight (L_col + L_map). Distances are in meters.
+            'lambda_rule': float(args.lambda_rule),
+            # Map margin (meters) for L_map (distance to road segment beyond this is penalized)
+            'map_margin': float(args.map_margin),
+            'coord_frame': str(args.coord_frame),
+            'ablate_cross_attn': bool(args.ablate_cross_attn),
+            'ablate_gate': str(args.ablate_gate),
+            'gate_fixed_ratio': (None if args.gate_fixed_ratio is None else float(args.gate_fixed_ratio)),
+        }
 
-    # Use subset for faster training
-    train_subset = torch.utils.data.Subset(train_dataset, range(min(args.train_subset, len(train_dataset))))
+        if torch.cuda.is_available():
+            device = torch.device(f"cuda:{local_rank}" if is_distributed else "cuda")
+        else:
+            device = torch.device("cpu")
 
-    if args.batch_by_location:
-        train_loader = DataLoader(
-            train_subset,
-            batch_sampler=LocationBatchSampler(train_subset, batch_size=args.batch_size, shuffle=True, drop_last=False),
-            collate_fn=collate_fn,
-        )
-    else:
-        train_loader = DataLoader(train_subset, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn)
+        mprint(f"Distributed: {is_distributed}, world_size={world_size}, rank={rank}, local_rank={local_rank}")
+        mprint(f"Device: {device}")
+        mprint(f"DIGIR root: {os.path.abspath(os.path.expanduser(args.digir_root)) if args.digir_root else '(from PYTHONPATH)'}")
+        mprint(f"Data path: {args.data}")
+        mprint(f"Save path: {args.save}")
+        mprint(f"Model config: d_model={config['d_model']}, diffusion_steps={config['diffusion_steps']}")
+        mprint(f"Coordinate frame: {args.coord_frame}")
+        mprint(f"Ablate cross-attn: {args.ablate_cross_attn}")
+        mprint(f"Ablate gate: {args.ablate_gate}")
+        if args.gate_fixed_ratio is not None:
+            r = float(max(0.0, min(1.0, float(args.gate_fixed_ratio))))
+            mprint(f"Gate fixed ratio: {r:.3f} (interaction={r:.3f}, intent={1.0-r:.3f})")
 
-    if args.batch_by_location:
-        val_loader = DataLoader(
-            val_dataset,
-            batch_sampler=LocationBatchSampler(val_dataset, batch_size=args.batch_size, shuffle=False, drop_last=False),
-            collate_fn=collate_fn,
-        )
-    else:
-        val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn)
+        # Load data
+        data_path = args.data
+        if not os.path.exists(data_path):
+            mprint(f"Error: Data not found at {data_path}")
+            return
 
-    print(f"Train: {len(train_subset)}, Val: {len(val_dataset)}")
+        train_dataset = InteractionDatasetForDIGIR(data_path, split='train', max_vehicles=10)
+        val_dataset = InteractionDatasetForDIGIR(data_path, split='val', max_vehicles=10)
 
-    # Create model
-    model = DIGIR(config).to(device)
-    num_params = sum(p.numel() for p in model.parameters()) / 1e6
-    print(f"Model parameters: {num_params:.2f}M")
+        # Use subset for faster training
+        train_subset = torch.utils.data.Subset(train_dataset, range(min(args.train_subset, len(train_dataset))))
 
-    optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.5)
+        pin_memory = torch.cuda.is_available()
+        loader_kwargs = {
+            "collate_fn": collate_fn,
+            "num_workers": int(args.num_workers),
+            "pin_memory": pin_memory,
+            "persistent_workers": (int(args.num_workers) > 0),
+        }
 
-    # Training
-    num_epochs = args.epochs
-    best_ade = float('inf')
-
-    print("\n" + "="*70)
-    print("Starting Training")
-    print("="*70)
-
-    for epoch in range(1, num_epochs + 1):
-        print(f"\nEpoch {epoch}/{num_epochs}")
-        print("-" * 70)
-
-        # Train
-        train_loss, train_gate_stats = train_epoch(
-            model,
-            train_loader,
-            optimizer,
-            device,
-            coord_frame=args.coord_frame,
-            log_gate_stats=args.log_gate_stats,
-        )
-        print(f"Train Loss: {train_loss:.4f}")
-        if args.log_gate_stats and train_gate_stats is not None:
-            print(f"  Gate(train): mean={train_gate_stats['GateMean']:.4f}, std={train_gate_stats['GateStd']:.4f}")
-
-        # Evaluate
-        metrics = evaluate(
-            model,
-            val_loader,
-            device,
-            num_samples=args.k,
-            max_batches=args.eval_batches,
-            coord_frame=args.coord_frame,
-            log_gate_stats=args.log_gate_stats,
-        )
-
-        print("\nMetrics:")
-        print(f"  Kinematic:")
-        print(f"    minADE_5:  {metrics['minADE_5']:.3f} m")
-        print(f"    minFDE_5:  {metrics['minFDE_5']:.3f} m")
-        print(f"    MissRate:  {metrics['MissRate']:.2%}")
-        print(f"  Semantic:")
-        print(f"    IntentAcc: {metrics['IntentAcc']:.2%}")
-        print(f"    ITC:       {metrics['ITC']:.2%}")
-        print(f"  Safety:")
-        print(f"    Collision: {metrics['CollisionRate']:.2%}")
-        print(f"    Off-Road:  {metrics['OffRoadRate']:.2%}")
-        if args.log_gate_stats:
-            print(f"  Gate:")
-            print(f"    Mean:      {metrics.get('GateMean', 0.0):.4f}")
-            print(f"    Std:       {metrics.get('GateStd', 0.0):.4f}")
-
-        # Per-location summary (only when location info is present)
-        per_loc = metrics.get('per_location', {}) or {}
-        if per_loc:
-            print("\nPer-location (avg over evaluated batches):")
-            for loc_name in sorted(per_loc.keys(), key=lambda x: str(x)):
-                m = per_loc[loc_name]
-                print(
-                    f"  {loc_name} | batches={m['batches']}"
-                    f" | minADE_5={m['minADE_5']:.3f}"
-                    f" | minFDE_5={m['minFDE_5']:.3f}"
-                    f" | MR={m['MissRate']:.2%}"
-                    f" | IA={m['IntentAcc']:.2%}"
-                    f" | ITC={m['ITC']:.2%}"
-                    f" | Col={m['CollisionRate']:.2%}"
-                    f" | OR={m['OffRoadRate']:.2%}"
+        train_sampler = None
+        train_batch_sampler = None
+        if is_distributed:
+            if args.batch_by_location:
+                train_batch_sampler = DistributedLocationBatchSampler(
+                    train_subset,
+                    batch_size=args.batch_size,
+                    num_replicas=world_size,
+                    rank=rank,
+                    shuffle=True,
+                    drop_last=False,
+                    seed=args.seed,
+                )
+                train_loader = DataLoader(
+                    train_subset,
+                    batch_sampler=train_batch_sampler,
+                    **loader_kwargs,
+                )
+            else:
+                train_sampler = DistributedSampler(
+                    train_subset,
+                    num_replicas=world_size,
+                    rank=rank,
+                    shuffle=True,
+                    drop_last=False,
+                    seed=args.seed,
+                )
+                train_loader = DataLoader(
+                    train_subset,
+                    batch_size=args.batch_size,
+                    sampler=train_sampler,
+                    shuffle=False,
+                    **loader_kwargs,
+                )
+        else:
+            if args.batch_by_location:
+                train_loader = DataLoader(
+                    train_subset,
+                    batch_sampler=LocationBatchSampler(
+                        train_subset,
+                        batch_size=args.batch_size,
+                        shuffle=True,
+                        drop_last=False,
+                        seed=args.seed,
+                    ),
+                    **loader_kwargs,
+                )
+            else:
+                train_loader = DataLoader(
+                    train_subset,
+                    batch_size=args.batch_size,
+                    shuffle=True,
+                    **loader_kwargs,
                 )
 
-        scheduler.step()
+        if is_distributed and not is_main:
+            val_loader = None
+        else:
+            if args.batch_by_location:
+                val_loader = DataLoader(
+                    val_dataset,
+                    batch_sampler=LocationBatchSampler(
+                        val_dataset,
+                        batch_size=args.batch_size,
+                        shuffle=False,
+                        drop_last=False,
+                        seed=args.seed,
+                    ),
+                    **loader_kwargs,
+                )
+            else:
+                val_loader = DataLoader(
+                    val_dataset,
+                    batch_size=args.batch_size,
+                    shuffle=False,
+                    **loader_kwargs,
+                )
 
-        # Save best model
-        if metrics['minADE_5'] < best_ade:
-            best_ade = metrics['minADE_5']
-            torch.save({
-                'epoch': epoch,
-                'model': model.state_dict(),
-                'config': config,
-                'metrics': metrics,
-            }, args.save)
-            print(f"  [*] Best model saved (minADE: {best_ade:.3f})")
+        mprint(f"Train: {len(train_subset)}, Val: {len(val_dataset)}")
 
-    print("\n" + "="*70)
-    print("Training Completed!")
-    print(f"Best minADE_5: {best_ade:.3f} m")
-    print("="*70)
+        # Create model
+        model = DIGIR(config).to(device)
+        if is_distributed:
+            model = DDP(
+                model,
+                device_ids=[local_rank],
+                output_device=local_rank,
+                find_unused_parameters=True,
+            )
+        num_params = sum(p.numel() for p in unwrap_model(model).parameters()) / 1e6
+        mprint(f"Model parameters: {num_params:.2f}M")
+
+        optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+        scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.5)
+
+        # Training
+        num_epochs = args.epochs
+        best_ade = float('inf')
+
+        mprint("\n" + "=" * 70)
+        mprint("Starting Training")
+        mprint("=" * 70)
+
+        for epoch in range(1, num_epochs + 1):
+            if train_sampler is not None:
+                train_sampler.set_epoch(epoch)
+            if train_batch_sampler is not None and hasattr(train_batch_sampler, "set_epoch"):
+                train_batch_sampler.set_epoch(epoch)
+
+            mprint(f"\nEpoch {epoch}/{num_epochs}")
+            mprint("-" * 70)
+
+            # Train
+            train_loss, train_gate_stats = train_epoch(
+                model,
+                train_loader,
+                optimizer,
+                device,
+                coord_frame=args.coord_frame,
+                log_gate_stats=args.log_gate_stats,
+                show_progress=is_main,
+            )
+            train_loss = reduce_mean_scalar(train_loss, device, is_distributed=is_distributed)
+            if args.log_gate_stats and train_gate_stats is not None:
+                train_gate_stats = reduce_mean_dict(train_gate_stats, device, is_distributed=is_distributed)
+
+            mprint(f"Train Loss: {train_loss:.4f}")
+            if args.log_gate_stats and train_gate_stats is not None:
+                mprint(f"  Gate(train): mean={train_gate_stats['GateMean']:.4f}, std={train_gate_stats['GateStd']:.4f}")
+
+            if is_distributed:
+                dist.barrier()
+
+            metrics = None
+            if is_main:
+                metrics = evaluate(
+                    model,
+                    val_loader,
+                    device,
+                    num_samples=args.k,
+                    max_batches=args.eval_batches,
+                    coord_frame=args.coord_frame,
+                    log_gate_stats=args.log_gate_stats,
+                    show_progress=True,
+                )
+
+                mprint("\nMetrics:")
+                mprint(f"  Kinematic:")
+                mprint(f"    minADE_5:  {metrics['minADE_5']:.3f} m")
+                mprint(f"    minFDE_5:  {metrics['minFDE_5']:.3f} m")
+                mprint(f"    MissRate:  {metrics['MissRate']:.2%}")
+                mprint(f"  Semantic:")
+                mprint(f"    IntentAcc: {metrics['IntentAcc']:.2%}")
+                mprint(f"    ITC:       {metrics['ITC']:.2%}")
+                mprint(f"  Safety:")
+                mprint(f"    Collision: {metrics['CollisionRate']:.2%}")
+                mprint(f"    Off-Road:  {metrics['OffRoadRate']:.2%}")
+                if args.log_gate_stats:
+                    mprint(f"  Gate:")
+                    mprint(f"    Mean:      {metrics.get('GateMean', 0.0):.4f}")
+                    mprint(f"    Std:       {metrics.get('GateStd', 0.0):.4f}")
+
+                # Per-location summary (only when location info is present)
+                per_loc = metrics.get('per_location', {}) or {}
+                if per_loc:
+                    mprint("\nPer-location (avg over evaluated batches):")
+                    for loc_name in sorted(per_loc.keys(), key=lambda x: str(x)):
+                        m = per_loc[loc_name]
+                        mprint(
+                            f"  {loc_name} | batches={m['batches']}"
+                            f" | minADE_5={m['minADE_5']:.3f}"
+                            f" | minFDE_5={m['minFDE_5']:.3f}"
+                            f" | MR={m['MissRate']:.2%}"
+                            f" | IA={m['IntentAcc']:.2%}"
+                            f" | ITC={m['ITC']:.2%}"
+                            f" | Col={m['CollisionRate']:.2%}"
+                            f" | OR={m['OffRoadRate']:.2%}"
+                        )
+
+                # Save best model
+                if metrics['minADE_5'] < best_ade:
+                    best_ade = metrics['minADE_5']
+                    torch.save({
+                        'epoch': epoch,
+                        'model': unwrap_model(model).state_dict(),
+                        'config': config,
+                        'metrics': metrics,
+                    }, args.save)
+                    mprint(f"  [*] Best model saved (minADE: {best_ade:.3f})")
+
+            if is_distributed:
+                dist.barrier()
+
+            scheduler.step()
+
+        mprint("\n" + "=" * 70)
+        mprint("Training Completed!")
+        mprint(f"Best minADE_5: {best_ade:.3f} m")
+        mprint("=" * 70)
+    finally:
+        cleanup_distributed()
 
 
 if __name__ == "__main__":
