@@ -3,6 +3,7 @@
 `train_digir_full.py` now supports:
 
 - Multi-GPU training with `torchrun` (DDP, for example 8x A100).
+- Multi-GPU evaluation aggregation in DDP (full validation is sharded across GPUs, then merged).
 - Code/data/output path separation via `--digir_root`, `--data_root`, and `--save_root`.
 
 ## 1) 8-GPU command (equivalent to your local command)

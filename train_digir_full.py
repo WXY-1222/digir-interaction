@@ -173,6 +173,7 @@ class DistributedLocationBatchSampler:
         shuffle=True,
         drop_last=False,
         seed=42,
+        even_divisible=True,
     ):
         self.dataset = dataset
         self.batch_size = batch_size
@@ -181,6 +182,7 @@ class DistributedLocationBatchSampler:
         self.shuffle = shuffle
         self.drop_last = drop_last
         self.seed = seed
+        self.even_divisible = bool(even_divisible)
         self.epoch = 0
 
     def set_epoch(self, epoch: int):
@@ -201,6 +203,11 @@ class DistributedLocationBatchSampler:
         all_batches = self._build_all_batches()
         if len(all_batches) == 0:
             return iter([])
+
+        if not self.even_divisible:
+            # Exact sharding for evaluation: no padding/duplication across ranks.
+            rank_batches = all_batches[self.rank::self.num_replicas]
+            return iter(rank_batches)
 
         if self.drop_last:
             total_size = (len(all_batches) // self.num_replicas) * self.num_replicas
@@ -224,9 +231,31 @@ class DistributedLocationBatchSampler:
                 seed=self.seed,
             )
         )
+        if not self.even_divisible:
+            return len(list(range(self.rank, base_len, self.num_replicas)))
         if self.drop_last:
             return base_len // self.num_replicas
         return int(math.ceil(base_len / self.num_replicas))
+
+
+class DistributedEvalSampler(torch.utils.data.Sampler):
+    """
+    Distributed sampler for evaluation without padding/duplication.
+    """
+    def __init__(self, dataset, num_replicas, rank):
+        self.dataset = dataset
+        self.num_replicas = int(num_replicas)
+        self.rank = int(rank)
+
+    def __iter__(self):
+        indices = list(range(len(self.dataset)))
+        return iter(indices[self.rank::self.num_replicas])
+
+    def __len__(self):
+        n = len(self.dataset)
+        if self.rank >= n:
+            return 0
+        return ((n - 1 - self.rank) // self.num_replicas) + 1
 
 
 def compute_min_ade_fde(pred_trajs, gt_traj):
@@ -466,19 +495,49 @@ def evaluate(
     """
     base_model = unwrap_model(model)
     base_model.eval()
+    is_distributed = dist.is_available() and dist.is_initialized()
+    world_size = dist.get_world_size() if is_distributed else 1
 
-    all_min_ade = []
-    all_min_fde = []
-    all_miss_rates = []
-    all_intent_acc = []
-    all_itc = []
-    all_collision = []
-    all_offroad = []
-    gate_means = []
-    gate_stds = []
+    metric_keys = [
+        'minADE_5',
+        'minFDE_5',
+        'MissRate',
+        'IntentAcc',
+        'ITC',
+        'CollisionRate',
+        'OffRoadRate',
+    ]
+    if log_gate_stats:
+        metric_keys.extend(['GateMean', 'GateStd'])
+
+    metric_sums = {k: 0.0 for k in metric_keys}
+    metric_cnts = {k: 0 for k in metric_keys}
 
     # Per-location aggregations (scheme 2A: each batch has a single location_name)
+    # Keep key set aligned with user-facing per_location fields.
+    per_loc_keys = ['minADE_5', 'minFDE_5', 'MissRate', 'IntentAcc', 'ITC', 'CollisionRate', 'OffRoadRate']
     per_loc = {}
+
+    def _ensure_loc(loc):
+        if loc not in per_loc:
+            per_loc[loc] = {
+                'sums': {k: 0.0 for k in per_loc_keys},
+                'cnts': {k: 0 for k in per_loc_keys},
+                'batches': 0,
+            }
+
+    def _add_metric(name, value):
+        if name not in metric_sums:
+            return
+        metric_sums[name] += float(value)
+        metric_cnts[name] += 1
+
+    def _add_loc_metric(loc, name, value):
+        if name not in per_loc_keys:
+            return
+        _ensure_loc(loc)
+        per_loc[loc]['sums'][name] += float(value)
+        per_loc[loc]['cnts'][name] += 1
 
     batch_count = 0
 
@@ -504,8 +563,12 @@ def evaluate(
             f"(dim={pred.dim()}). Expected (B,N,T,2) or with a singleton sample dim."
         )
 
-    # max_batches <= 0 means evaluate the full dataloader
-    use_max = max_batches if (max_batches is not None and max_batches > 0) else len(dataloader)
+    # max_batches <= 0 means evaluate the full dataloader.
+    # In distributed eval, dataloader is already sharded.
+    if max_batches is not None and max_batches > 0:
+        use_max = int(math.ceil(max_batches / world_size)) if is_distributed else int(max_batches)
+    else:
+        use_max = len(dataloader)
 
     for batch in tqdm(
         dataloader,
@@ -521,16 +584,7 @@ def evaluate(
         if 'location_names' in batch and batch['location_names']:
             # collate_fn guarantees all are the same when using scheme 2A sampler
             loc_name = batch['location_names'][0]
-        if loc_name not in per_loc:
-            per_loc[loc_name] = {
-                'minADE_5': [],
-                'minFDE_5': [],
-                'MissRate': [],
-                'IntentAcc': [],
-                'ITC': [],
-                'CollisionRate': [],
-                'OffRoadRate': [],
-            }
+        _ensure_loc(loc_name)
 
         trajectories = batch['trajectories'].to(device)  # (B, N, 8, 4)
         future_traj = batch['future_trajectory'].to(device)  # (B, N, 12, 2)
@@ -595,15 +649,15 @@ def evaluate(
 
             ade_v = min_ade_valid.mean().item()
             fde_v = min_fde_valid.mean().item()
-            all_min_ade.append(ade_v)
-            all_min_fde.append(fde_v)
-            per_loc[loc_name]['minADE_5'].append(ade_v)
-            per_loc[loc_name]['minFDE_5'].append(fde_v)
+            _add_metric('minADE_5', ade_v)
+            _add_metric('minFDE_5', fde_v)
+            _add_loc_metric(loc_name, 'minADE_5', ade_v)
+            _add_loc_metric(loc_name, 'minFDE_5', fde_v)
 
             # Miss Rate
             miss_rate = (min_fde_valid > miss_threshold).float().mean().item()
-            all_miss_rates.append(miss_rate)
-            per_loc[loc_name]['MissRate'].append(miss_rate)
+            _add_metric('MissRate', miss_rate)
+            _add_loc_metric(loc_name, 'MissRate', miss_rate)
 
         # ===== 2. Intent Accuracy =====
         outputs = base_model(trajectories_norm, kg_data, mode='eval')
@@ -613,27 +667,29 @@ def evaluate(
             gw = outputs['gate_weights']
             if gw is not None and torch.is_tensor(gw):
                 gw = torch.nan_to_num(gw, nan=0.0, posinf=0.0, neginf=0.0).float()
-                gate_means.append(float(gw.mean().item()))
-                gate_stds.append(float(gw.std().item()))
+                _add_metric('GateMean', float(gw.mean().item()))
+                _add_metric('GateStd', float(gw.std().item()))
 
         valid_intent = (intent_labels >= 0) & valid_mask
         if valid_intent.any():
             intent_acc = ((intent_pred == intent_labels) & valid_intent).float().sum() / valid_intent.sum()
-            all_intent_acc.append(intent_acc.item())
-            per_loc[loc_name]['IntentAcc'].append(intent_acc.item())
+            intent_acc_v = intent_acc.item()
+            _add_metric('IntentAcc', intent_acc_v)
+            _add_loc_metric(loc_name, 'IntentAcc', intent_acc_v)
 
         # ===== 3. Intent-Trajectory Consistency =====
         best_pred = pred_trajs_k[0]
         itc = compute_intent_trajectory_consistency(best_pred, intent_pred)
-        all_itc.append(itc)
-        per_loc[loc_name]['ITC'].append(itc)
+        _add_metric('ITC', itc)
+        _add_loc_metric(loc_name, 'ITC', itc)
+        per_loc[loc_name]['batches'] += 1
 
         # ===== 4. Collision Rate =====
         # Predictions are local (future relative to last obs); add global last (x,y) per agent.
         best_pred_global = best_pred + last_pos_global
         cr = compute_collision_rate(best_pred_global, vehicle_masks, vehicle_lengths, vehicle_widths)
-        all_collision.append(cr)
-        per_loc[loc_name]['CollisionRate'].append(cr)
+        _add_metric('CollisionRate', cr)
+        _add_loc_metric(loc_name, 'CollisionRate', cr)
 
         # ===== 5. Off-Road Rate =====
         # Calibrate off-road threshold (meters). With the current "nodes as drivable neighborhood"
@@ -646,34 +702,55 @@ def evaluate(
             offroad_threshold=3.0,
             debug=False
         )
-        all_offroad.append(or_rate)
-        per_loc[loc_name]['OffRoadRate'].append(or_rate)
+        _add_metric('OffRoadRate', or_rate)
+        _add_loc_metric(loc_name, 'OffRoadRate', or_rate)
 
-    # Aggregate metrics
-    metrics = {
-        'minADE_5': np.mean(all_min_ade) if all_min_ade else 0,
-        'minFDE_5': np.mean(all_min_fde) if all_min_fde else 0,
-        'MissRate': np.mean(all_miss_rates) if all_miss_rates else 0,
-        'IntentAcc': np.mean(all_intent_acc) if all_intent_acc else 0,
-        'ITC': np.mean(all_itc) if all_itc else 0,
-        'CollisionRate': np.mean(all_collision) if all_collision else 0,
-        'OffRoadRate': np.mean(all_offroad) if all_offroad else 0,
-    }
-    if log_gate_stats:
-        metrics['GateMean'] = float(np.mean(gate_means)) if gate_means else 0.0
-        metrics['GateStd'] = float(np.mean(gate_stds)) if gate_stds else 0.0
+    # Aggregate global metrics across distributed ranks.
+    reduce_vec = []
+    for k in metric_keys:
+        reduce_vec.extend([metric_sums[k], float(metric_cnts[k])])
+    reduce_tensor = torch.tensor(reduce_vec, dtype=torch.float64, device=device)
+    if is_distributed:
+        dist.all_reduce(reduce_tensor, op=dist.ReduceOp.SUM)
+
+    metrics = {}
+    for i, k in enumerate(metric_keys):
+        s = float(reduce_tensor[2 * i].item())
+        c = int(round(float(reduce_tensor[2 * i + 1].item())))
+        metrics[k] = (s / c) if c > 0 else 0.0
+
+    # Aggregate per-location metrics across distributed ranks.
+    if is_distributed:
+        gathered = [None for _ in range(world_size)]
+        dist.all_gather_object(gathered, per_loc)
+        merged_loc = {}
+        for loc_payload in gathered:
+            if loc_payload is None:
+                continue
+            for loc, vals in loc_payload.items():
+                if loc not in merged_loc:
+                    merged_loc[loc] = {
+                        'sums': {k: 0.0 for k in per_loc_keys},
+                        'cnts': {k: 0 for k in per_loc_keys},
+                        'batches': 0,
+                    }
+                for k in per_loc_keys:
+                    merged_loc[loc]['sums'][k] += float(vals['sums'].get(k, 0.0))
+                    merged_loc[loc]['cnts'][k] += int(vals['cnts'].get(k, 0))
+                merged_loc[loc]['batches'] += int(vals.get('batches', 0))
+        per_loc = merged_loc
 
     per_location_metrics = {}
     for loc, vals in per_loc.items():
         per_location_metrics[loc] = {
-            'minADE_5': float(np.mean(vals['minADE_5'])) if vals['minADE_5'] else 0.0,
-            'minFDE_5': float(np.mean(vals['minFDE_5'])) if vals['minFDE_5'] else 0.0,
-            'MissRate': float(np.mean(vals['MissRate'])) if vals['MissRate'] else 0.0,
-            'IntentAcc': float(np.mean(vals['IntentAcc'])) if vals['IntentAcc'] else 0.0,
-            'ITC': float(np.mean(vals['ITC'])) if vals['ITC'] else 0.0,
-            'CollisionRate': float(np.mean(vals['CollisionRate'])) if vals['CollisionRate'] else 0.0,
-            'OffRoadRate': float(np.mean(vals['OffRoadRate'])) if vals['OffRoadRate'] else 0.0,
-            'batches': len(vals['ITC']),
+            'minADE_5': (vals['sums']['minADE_5'] / vals['cnts']['minADE_5']) if vals['cnts']['minADE_5'] > 0 else 0.0,
+            'minFDE_5': (vals['sums']['minFDE_5'] / vals['cnts']['minFDE_5']) if vals['cnts']['minFDE_5'] > 0 else 0.0,
+            'MissRate': (vals['sums']['MissRate'] / vals['cnts']['MissRate']) if vals['cnts']['MissRate'] > 0 else 0.0,
+            'IntentAcc': (vals['sums']['IntentAcc'] / vals['cnts']['IntentAcc']) if vals['cnts']['IntentAcc'] > 0 else 0.0,
+            'ITC': (vals['sums']['ITC'] / vals['cnts']['ITC']) if vals['cnts']['ITC'] > 0 else 0.0,
+            'CollisionRate': (vals['sums']['CollisionRate'] / vals['cnts']['CollisionRate']) if vals['cnts']['CollisionRate'] > 0 else 0.0,
+            'OffRoadRate': (vals['sums']['OffRoadRate'] / vals['cnts']['OffRoadRate']) if vals['cnts']['OffRoadRate'] > 0 else 0.0,
+            'batches': int(vals.get('batches', 0)),
         }
 
     metrics['per_location'] = per_location_metrics
@@ -986,6 +1063,8 @@ def main():
 
         train_sampler = None
         train_batch_sampler = None
+        val_sampler = None
+        val_batch_sampler = None
         if is_distributed:
             if args.batch_by_location:
                 train_batch_sampler = DistributedLocationBatchSampler(
@@ -1018,6 +1097,36 @@ def main():
                     shuffle=False,
                     **loader_kwargs,
                 )
+
+            if args.batch_by_location:
+                val_batch_sampler = DistributedLocationBatchSampler(
+                    val_dataset,
+                    batch_size=args.batch_size,
+                    num_replicas=world_size,
+                    rank=rank,
+                    shuffle=False,
+                    drop_last=False,
+                    seed=args.seed,
+                    even_divisible=False,  # no duplication during eval aggregation
+                )
+                val_loader = DataLoader(
+                    val_dataset,
+                    batch_sampler=val_batch_sampler,
+                    **loader_kwargs,
+                )
+            else:
+                val_sampler = DistributedEvalSampler(
+                    val_dataset,
+                    num_replicas=world_size,
+                    rank=rank,
+                )
+                val_loader = DataLoader(
+                    val_dataset,
+                    batch_size=args.batch_size,
+                    sampler=val_sampler,
+                    shuffle=False,
+                    **loader_kwargs,
+                )
         else:
             if args.batch_by_location:
                 train_loader = DataLoader(
@@ -1039,9 +1148,6 @@ def main():
                     **loader_kwargs,
                 )
 
-        if is_distributed and not is_main:
-            val_loader = None
-        else:
             if args.batch_by_location:
                 val_loader = DataLoader(
                     val_dataset,
@@ -1092,6 +1198,10 @@ def main():
                 train_sampler.set_epoch(epoch)
             if train_batch_sampler is not None and hasattr(train_batch_sampler, "set_epoch"):
                 train_batch_sampler.set_epoch(epoch)
+            if val_sampler is not None and hasattr(val_sampler, "set_epoch"):
+                val_sampler.set_epoch(epoch)
+            if val_batch_sampler is not None and hasattr(val_batch_sampler, "set_epoch"):
+                val_batch_sampler.set_epoch(epoch)
 
             mprint(f"\nEpoch {epoch}/{num_epochs}")
             mprint("-" * 70)
@@ -1117,19 +1227,18 @@ def main():
             if is_distributed:
                 dist.barrier()
 
-            metrics = None
-            if is_main:
-                metrics = evaluate(
-                    model,
-                    val_loader,
-                    device,
-                    num_samples=args.k,
-                    max_batches=args.eval_batches,
-                    coord_frame=args.coord_frame,
-                    log_gate_stats=args.log_gate_stats,
-                    show_progress=True,
-                )
+            metrics = evaluate(
+                model,
+                val_loader,
+                device,
+                num_samples=args.k,
+                max_batches=args.eval_batches,
+                coord_frame=args.coord_frame,
+                log_gate_stats=args.log_gate_stats,
+                show_progress=is_main,
+            )
 
+            if is_main:
                 mprint("\nMetrics:")
                 mprint(f"  Kinematic:")
                 mprint(f"    minADE_5:  {metrics['minADE_5']:.3f} m")
