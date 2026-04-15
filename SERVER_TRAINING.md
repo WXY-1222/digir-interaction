@@ -70,3 +70,5 @@ done
 ```
 
 You can also run discrete baselines with `--ablate_gate force_intent` and `--ablate_gate force_interaction`.
+
+Note: `pin_memory` is disabled by default for compatibility. If your environment is stable, you can add `--pin_memory` to try faster host-to-GPU transfer.

@@ -836,6 +836,11 @@ def main():
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--num_workers", type=int, default=4, help="DataLoader worker processes per rank.")
+    parser.add_argument(
+        "--pin_memory",
+        action="store_true",
+        help="Enable DataLoader pin_memory. Default is off for compatibility with expanded-view tensors.",
+    )
     parser.add_argument("--batch_by_location", action="store_true", help="Scheme 2A: group batches by location_name")
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
@@ -952,6 +957,7 @@ def main():
         mprint(f"Save path: {args.save}")
         mprint(f"Model config: d_model={config['d_model']}, diffusion_steps={config['diffusion_steps']}")
         mprint(f"Coordinate frame: {args.coord_frame}")
+        mprint(f"DataLoader workers: {int(args.num_workers)}, pin_memory: {bool(args.pin_memory)}")
         mprint(f"Ablate cross-attn: {args.ablate_cross_attn}")
         mprint(f"Ablate gate: {args.ablate_gate}")
         if args.gate_fixed_ratio is not None:
@@ -970,7 +976,7 @@ def main():
         # Use subset for faster training
         train_subset = torch.utils.data.Subset(train_dataset, range(min(args.train_subset, len(train_dataset))))
 
-        pin_memory = torch.cuda.is_available()
+        pin_memory = bool(args.pin_memory) and torch.cuda.is_available()
         loader_kwargs = {
             "collate_fn": collate_fn,
             "num_workers": int(args.num_workers),
