@@ -347,7 +347,7 @@ def compute_min_ade_fde(pred_trajs, gt_traj):
     return min_ade, min_fde
 
 
-def compute_intent_trajectory_consistency(pred_trajs, intent_pred):
+def compute_intent_trajectory_consistency(pred_trajs, intent_pred, valid_mask=None, return_counts=False):
     """
     Compute Intent-Trajectory Consistency (ITC)
     Measures if trajectory endpoint matches predicted intent
@@ -382,12 +382,23 @@ def compute_intent_trajectory_consistency(pred_trajs, intent_pred):
 
     # Consistency: predicted intent matches actual trajectory
     consistent = (intent_pred == actual_intent).float()
-    itc = torch.mean(consistent)
+    if valid_mask is not None:
+        valid_mask = valid_mask.bool()
+        consistent = consistent[valid_mask]
+    else:
+        consistent = consistent.reshape(-1)
 
-    return itc.item()
+    total = int(consistent.numel())
+    consistent_sum = float(consistent.sum().item()) if total > 0 else 0.0
+    if return_counts:
+        return consistent_sum, total
+
+    if total == 0:
+        return 0.0
+    return consistent_sum / float(total)
 
 
-def compute_collision_rate(pred_trajs, vehicle_masks, vehicle_lengths, vehicle_widths):
+def compute_collision_rate(pred_trajs, vehicle_masks, vehicle_lengths, vehicle_widths, return_counts=False):
     """
     Compute Collision Rate (CR)
     Percentage of trajectories where ego vehicle overlaps with others
@@ -438,6 +449,8 @@ def compute_collision_rate(pred_trajs, vehicle_masks, vehicle_lengths, vehicle_w
         if has_collision:
             collision_count += 1
 
+    if return_counts:
+        return float(collision_count), int(total_valid)
     return collision_count / max(total_valid, 1)
 
 
@@ -480,6 +493,7 @@ def compute_off_road_rate(
     edge_index=None,
     offroad_threshold=2.0,
     debug=False,
+    return_counts=False,
 ):
     """
     Compute Off-Road Rate (OR) using an approximation.
@@ -531,6 +545,8 @@ def compute_off_road_rate(
         if has_offroad:
             off_road_count += 1
 
+    if return_counts:
+        return float(off_road_count), int(total_valid)
     return off_road_count / max(total_valid, 1)
 
 
@@ -563,11 +579,10 @@ def evaluate(
         'CollisionRate',
         'OffRoadRate',
     ]
-    if log_gate_stats:
-        metric_keys.extend(['GateMean', 'GateStd'])
-
-    metric_sums = {k: 0.0 for k in metric_keys}
-    metric_cnts = {k: 0 for k in metric_keys}
+    metric_accum = {k: {"num": 0.0, "den": 0.0} for k in metric_keys}
+    gate_sum = 0.0
+    gate_sq_sum = 0.0
+    gate_count = 0
 
     # Per-location aggregations (scheme 2A: each batch has a single location_name)
     # Keep key set aligned with user-facing per_location fields.
@@ -577,23 +592,28 @@ def evaluate(
     def _ensure_loc(loc):
         if loc not in per_loc:
             per_loc[loc] = {
-                'sums': {k: 0.0 for k in per_loc_keys},
-                'cnts': {k: 0 for k in per_loc_keys},
+                'accum': {k: {'num': 0.0, 'den': 0.0} for k in per_loc_keys},
                 'batches': 0,
             }
 
-    def _add_metric(name, value):
-        if name not in metric_sums:
+    def _add_metric(name, numerator, denominator):
+        if name not in metric_accum:
             return
-        metric_sums[name] += float(value)
-        metric_cnts[name] += 1
+        denominator = float(denominator)
+        if denominator <= 0:
+            return
+        metric_accum[name]['num'] += float(numerator)
+        metric_accum[name]['den'] += denominator
 
-    def _add_loc_metric(loc, name, value):
+    def _add_loc_metric(loc, name, numerator, denominator):
         if name not in per_loc_keys:
             return
+        denominator = float(denominator)
+        if denominator <= 0:
+            return
         _ensure_loc(loc)
-        per_loc[loc]['sums'][name] += float(value)
-        per_loc[loc]['cnts'][name] += 1
+        per_loc[loc]['accum'][name]['num'] += float(numerator)
+        per_loc[loc]['accum'][name]['den'] += denominator
 
     batch_count = 0
 
@@ -702,18 +722,18 @@ def evaluate(
         if valid_mask.any():
             min_ade_valid = min_ade[valid_mask]
             min_fde_valid = min_fde[valid_mask]
-
-            ade_v = min_ade_valid.mean().item()
-            fde_v = min_fde_valid.mean().item()
-            _add_metric('minADE_5', ade_v)
-            _add_metric('minFDE_5', fde_v)
-            _add_loc_metric(loc_name, 'minADE_5', ade_v)
-            _add_loc_metric(loc_name, 'minFDE_5', fde_v)
+            valid_count = int(min_ade_valid.numel())
+            ade_sum = float(min_ade_valid.sum().item())
+            fde_sum = float(min_fde_valid.sum().item())
+            _add_metric('minADE_5', ade_sum, valid_count)
+            _add_metric('minFDE_5', fde_sum, valid_count)
+            _add_loc_metric(loc_name, 'minADE_5', ade_sum, valid_count)
+            _add_loc_metric(loc_name, 'minFDE_5', fde_sum, valid_count)
 
             # Miss Rate
-            miss_rate = (min_fde_valid > miss_threshold).float().mean().item()
-            _add_metric('MissRate', miss_rate)
-            _add_loc_metric(loc_name, 'MissRate', miss_rate)
+            miss_sum = float((min_fde_valid > miss_threshold).float().sum().item())
+            _add_metric('MissRate', miss_sum, valid_count)
+            _add_loc_metric(loc_name, 'MissRate', miss_sum, valid_count)
 
         # ===== 2. Intent Accuracy =====
         outputs = base_model(trajectories_norm, kg_data, mode='eval')
@@ -723,57 +743,86 @@ def evaluate(
             gw = outputs['gate_weights']
             if gw is not None and torch.is_tensor(gw):
                 gw = torch.nan_to_num(gw, nan=0.0, posinf=0.0, neginf=0.0).float()
-                _add_metric('GateMean', float(gw.mean().item()))
-                _add_metric('GateStd', float(gw.std().item()))
+                gate_sum += float(gw.sum().item())
+                gate_sq_sum += float((gw * gw).sum().item())
+                gate_count += int(gw.numel())
 
         valid_intent = (intent_labels >= 0) & valid_mask
         if valid_intent.any():
-            intent_acc = ((intent_pred == intent_labels) & valid_intent).float().sum() / valid_intent.sum()
-            intent_acc_v = intent_acc.item()
-            _add_metric('IntentAcc', intent_acc_v)
-            _add_loc_metric(loc_name, 'IntentAcc', intent_acc_v)
+            correct_sum = float(((intent_pred == intent_labels) & valid_intent).float().sum().item())
+            intent_count = int(valid_intent.sum().item())
+            _add_metric('IntentAcc', correct_sum, intent_count)
+            _add_loc_metric(loc_name, 'IntentAcc', correct_sum, intent_count)
 
         # ===== 3. Intent-Trajectory Consistency =====
         best_pred = pred_trajs_k[0]
-        itc = compute_intent_trajectory_consistency(best_pred, intent_pred)
-        _add_metric('ITC', itc)
-        _add_loc_metric(loc_name, 'ITC', itc)
+        itc_sum, itc_count = compute_intent_trajectory_consistency(
+            best_pred,
+            intent_pred,
+            valid_mask=valid_mask,
+            return_counts=True,
+        )
+        _add_metric('ITC', itc_sum, itc_count)
+        _add_loc_metric(loc_name, 'ITC', itc_sum, itc_count)
         per_loc[loc_name]['batches'] += 1
 
         # ===== 4. Collision Rate =====
         # Predictions are local (future relative to last obs); add global last (x,y) per agent.
         best_pred_global = best_pred + last_pos_global
-        cr = compute_collision_rate(best_pred_global, vehicle_masks, vehicle_lengths, vehicle_widths)
-        _add_metric('CollisionRate', cr)
-        _add_loc_metric(loc_name, 'CollisionRate', cr)
+        cr_sum, cr_count = compute_collision_rate(
+            best_pred_global,
+            vehicle_masks,
+            vehicle_lengths,
+            vehicle_widths,
+            return_counts=True,
+        )
+        _add_metric('CollisionRate', cr_sum, cr_count)
+        _add_loc_metric(loc_name, 'CollisionRate', cr_sum, cr_count)
 
         # ===== 5. Off-Road Rate =====
         # Calibrate off-road threshold (meters). With the current "nodes as drivable neighborhood"
         # approximation, 2m is too strict (would lead to ~100% off-road).
-        or_rate = compute_off_road_rate(
+        or_sum, or_count = compute_off_road_rate(
             best_pred_global,
             vehicle_masks,
             kg_positions_global,
             edge_index=kg_data['edge_index'],
             offroad_threshold=3.0,
-            debug=False
+            debug=False,
+            return_counts=True,
         )
-        _add_metric('OffRoadRate', or_rate)
-        _add_loc_metric(loc_name, 'OffRoadRate', or_rate)
+        _add_metric('OffRoadRate', or_sum, or_count)
+        _add_loc_metric(loc_name, 'OffRoadRate', or_sum, or_count)
 
     # Aggregate global metrics across distributed ranks.
     reduce_vec = []
     for k in metric_keys:
-        reduce_vec.extend([metric_sums[k], float(metric_cnts[k])])
+        reduce_vec.extend([metric_accum[k]['num'], metric_accum[k]['den']])
+    if log_gate_stats:
+        reduce_vec.extend([gate_sum, gate_sq_sum, float(gate_count)])
     reduce_tensor = torch.tensor(reduce_vec, dtype=torch.float64, device=device)
     if is_distributed:
         dist.all_reduce(reduce_tensor, op=dist.ReduceOp.SUM)
 
     metrics = {}
+    idx = 0
     for i, k in enumerate(metric_keys):
-        s = float(reduce_tensor[2 * i].item())
-        c = int(round(float(reduce_tensor[2 * i + 1].item())))
-        metrics[k] = (s / c) if c > 0 else 0.0
+        num = float(reduce_tensor[idx].item())
+        den = float(reduce_tensor[idx + 1].item())
+        idx += 2
+        metrics[k] = (num / den) if den > 0 else 0.0
+    if log_gate_stats:
+        gate_sum_all = float(reduce_tensor[idx].item())
+        gate_sq_sum_all = float(reduce_tensor[idx + 1].item())
+        gate_cnt_all = float(reduce_tensor[idx + 2].item())
+        if gate_cnt_all > 0:
+            gate_mean = gate_sum_all / gate_cnt_all
+            gate_var = max(gate_sq_sum_all / gate_cnt_all - gate_mean * gate_mean, 0.0)
+            metrics['GateMean'] = gate_mean
+            metrics['GateStd'] = float(math.sqrt(gate_var))
+        else:
+            metrics['GateMean'] = 0.0
+            metrics['GateStd'] = 0.0
 
     # Aggregate per-location metrics across distributed ranks.
     if is_distributed:
@@ -786,26 +835,25 @@ def evaluate(
             for loc, vals in loc_payload.items():
                 if loc not in merged_loc:
                     merged_loc[loc] = {
-                        'sums': {k: 0.0 for k in per_loc_keys},
-                        'cnts': {k: 0 for k in per_loc_keys},
+                        'accum': {k: {'num': 0.0, 'den': 0.0} for k in per_loc_keys},
                         'batches': 0,
                     }
                 for k in per_loc_keys:
-                    merged_loc[loc]['sums'][k] += float(vals['sums'].get(k, 0.0))
-                    merged_loc[loc]['cnts'][k] += int(vals['cnts'].get(k, 0))
+                    merged_loc[loc]['accum'][k]['num'] += float(vals['accum'][k].get('num', 0.0))
+                    merged_loc[loc]['accum'][k]['den'] += float(vals['accum'][k].get('den', 0.0))
                 merged_loc[loc]['batches'] += int(vals.get('batches', 0))
         per_loc = merged_loc
 
     per_location_metrics = {}
     for loc, vals in per_loc.items():
         per_location_metrics[loc] = {
-            'minADE_5': (vals['sums']['minADE_5'] / vals['cnts']['minADE_5']) if vals['cnts']['minADE_5'] > 0 else 0.0,
-            'minFDE_5': (vals['sums']['minFDE_5'] / vals['cnts']['minFDE_5']) if vals['cnts']['minFDE_5'] > 0 else 0.0,
-            'MissRate': (vals['sums']['MissRate'] / vals['cnts']['MissRate']) if vals['cnts']['MissRate'] > 0 else 0.0,
-            'IntentAcc': (vals['sums']['IntentAcc'] / vals['cnts']['IntentAcc']) if vals['cnts']['IntentAcc'] > 0 else 0.0,
-            'ITC': (vals['sums']['ITC'] / vals['cnts']['ITC']) if vals['cnts']['ITC'] > 0 else 0.0,
-            'CollisionRate': (vals['sums']['CollisionRate'] / vals['cnts']['CollisionRate']) if vals['cnts']['CollisionRate'] > 0 else 0.0,
-            'OffRoadRate': (vals['sums']['OffRoadRate'] / vals['cnts']['OffRoadRate']) if vals['cnts']['OffRoadRate'] > 0 else 0.0,
+            'minADE_5': (vals['accum']['minADE_5']['num'] / vals['accum']['minADE_5']['den']) if vals['accum']['minADE_5']['den'] > 0 else 0.0,
+            'minFDE_5': (vals['accum']['minFDE_5']['num'] / vals['accum']['minFDE_5']['den']) if vals['accum']['minFDE_5']['den'] > 0 else 0.0,
+            'MissRate': (vals['accum']['MissRate']['num'] / vals['accum']['MissRate']['den']) if vals['accum']['MissRate']['den'] > 0 else 0.0,
+            'IntentAcc': (vals['accum']['IntentAcc']['num'] / vals['accum']['IntentAcc']['den']) if vals['accum']['IntentAcc']['den'] > 0 else 0.0,
+            'ITC': (vals['accum']['ITC']['num'] / vals['accum']['ITC']['den']) if vals['accum']['ITC']['den'] > 0 else 0.0,
+            'CollisionRate': (vals['accum']['CollisionRate']['num'] / vals['accum']['CollisionRate']['den']) if vals['accum']['CollisionRate']['den'] > 0 else 0.0,
+            'OffRoadRate': (vals['accum']['OffRoadRate']['num'] / vals['accum']['OffRoadRate']['den']) if vals['accum']['OffRoadRate']['den'] > 0 else 0.0,
             'batches': int(vals.get('batches', 0)),
         }
 
