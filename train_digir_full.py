@@ -1032,6 +1032,12 @@ def main():
     parser.add_argument("--train_subset", type=int, default=5000)
     parser.add_argument("--eval_batches", type=int, default=20)
     parser.add_argument(
+        "--eval_every",
+        type=int,
+        default=1,
+        help="Run evaluation every N epochs (always evaluates at the last epoch).",
+    )
+    parser.add_argument(
         "--eval_locations",
         type=str,
         default="",
@@ -1384,6 +1390,12 @@ def main():
 
             if is_distributed:
                 dist.barrier()
+
+            should_eval = (epoch % max(1, int(args.eval_every)) == 0) or (epoch == num_epochs)
+            if not should_eval:
+                mprint(f"Skip eval at epoch {epoch} (eval_every={int(args.eval_every)})")
+                scheduler.step()
+                continue
 
             metrics = evaluate(
                 model,
