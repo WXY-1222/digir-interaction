@@ -55,6 +55,62 @@ def resolve_rooted_path(path_value: str, root: str = "") -> str:
     return os.path.abspath(expanded)
 
 
+def parse_csv_set(raw: str, *, lower: bool = False):
+    if raw is None:
+        return set()
+    items = [x.strip() for x in str(raw).split(",") if x.strip()]
+    if lower:
+        items = [x.lower() for x in items]
+    return set(items)
+
+
+def infer_location_type(location_name):
+    key = str(location_name or "").lower()
+    if "intersection" in key:
+        return "intersection"
+    if "roundabout" in key:
+        return "roundabout"
+    if "merging" in key:
+        return "merging"
+    if "lanechange" in key or "lane_change" in key:
+        return "lanechange"
+    return "other"
+
+
+def filter_dataset_by_location(dataset, include_locations=None, include_types=None):
+    """
+    Filter dataset by exact location_name and/or inferred location type.
+    Returns (filtered_dataset, debug_info_dict).
+    """
+    include_locations = include_locations or set()
+    include_types = include_types or set()
+
+    if hasattr(dataset, "sample_locations"):
+        locations = list(dataset.sample_locations)
+    elif hasattr(dataset, "dataset") and hasattr(dataset.dataset, "sample_locations"):
+        locations = [dataset.dataset.sample_locations[i] for i in dataset.indices]
+    else:
+        locations = [None for _ in range(len(dataset))]
+
+    selected_indices = []
+    selected_locs = []
+    for idx, loc in enumerate(locations):
+        loc_ok = (not include_locations) or (loc in include_locations)
+        type_ok = (not include_types) or (infer_location_type(loc) in include_types)
+        if loc_ok and type_ok:
+            selected_indices.append(idx)
+            selected_locs.append(loc)
+
+    filtered = torch.utils.data.Subset(dataset, selected_indices)
+    info = {
+        "total_samples": len(dataset),
+        "selected_samples": len(selected_indices),
+        "total_locations": len(set(locations)),
+        "selected_locations": sorted(set(selected_locs), key=lambda x: str(x)),
+    }
+    return filtered, info
+
+
 def setup_distributed(dist_backend: str = "nccl"):
     """Initialize distributed state from torchrun env vars."""
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
@@ -927,6 +983,20 @@ def main():
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--train_subset", type=int, default=5000)
     parser.add_argument("--eval_batches", type=int, default=20)
+    parser.add_argument(
+        "--eval_locations",
+        type=str,
+        default="",
+        help="Optional comma-separated exact location_name list for evaluation only "
+        "(e.g., DR_USA_Intersection_EP0,DR_DEU_Roundabout_OF).",
+    )
+    parser.add_argument(
+        "--eval_location_types",
+        type=str,
+        default="",
+        help="Optional comma-separated inferred location types for evaluation only. "
+        "Supported: intersection,roundabout,merging,lanechange,other",
+    )
     parser.add_argument("--k", type=int, default=5)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--lambda_rule", type=float, default=1e-3, help="Weight for (L_col + L_map). Set 0 for baseline.")
@@ -974,6 +1044,15 @@ def main():
 
     args.data = resolve_rooted_path(args.data, args.data_root)
     args.save = resolve_rooted_path(args.save, args.save_root)
+    eval_locations = parse_csv_set(args.eval_locations, lower=False)
+    eval_location_types = parse_csv_set(args.eval_location_types, lower=True)
+    supported_eval_types = {"intersection", "roundabout", "merging", "lanechange", "other"}
+    unknown_eval_types = sorted(eval_location_types - supported_eval_types)
+    if unknown_eval_types:
+        raise ValueError(
+            "Unsupported --eval_location_types: "
+            f"{unknown_eval_types}. Supported: {sorted(supported_eval_types)}"
+        )
 
     DIGIR = import_digir_model(args.digir_root)
     is_distributed, rank, local_rank, world_size = setup_distributed(args.dist_backend)
@@ -1053,6 +1132,19 @@ def main():
 
         train_dataset = InteractionDatasetForDIGIR(data_path, split='train', max_vehicles=10)
         val_dataset = InteractionDatasetForDIGIR(data_path, split='val', max_vehicles=10)
+        eval_dataset = val_dataset
+        eval_filter_info = None
+        if eval_locations or eval_location_types:
+            eval_dataset, eval_filter_info = filter_dataset_by_location(
+                val_dataset,
+                include_locations=eval_locations,
+                include_types=eval_location_types,
+            )
+            if len(eval_dataset) == 0:
+                raise ValueError(
+                    "Evaluation filter selected 0 samples. "
+                    "Please check --eval_locations / --eval_location_types."
+                )
 
         # Use subset for faster training
         train_subset = torch.utils.data.Subset(train_dataset, range(min(args.train_subset, len(train_dataset))))
@@ -1104,7 +1196,7 @@ def main():
 
             if args.batch_by_location:
                 val_batch_sampler = DistributedLocationBatchSampler(
-                    val_dataset,
+                    eval_dataset,
                     batch_size=args.batch_size,
                     num_replicas=world_size,
                     rank=rank,
@@ -1114,18 +1206,18 @@ def main():
                     even_divisible=False,  # no duplication during eval aggregation
                 )
                 val_loader = DataLoader(
-                    val_dataset,
+                    eval_dataset,
                     batch_sampler=val_batch_sampler,
                     **loader_kwargs,
                 )
             else:
                 val_sampler = DistributedEvalSampler(
-                    val_dataset,
+                    eval_dataset,
                     num_replicas=world_size,
                     rank=rank,
                 )
                 val_loader = DataLoader(
-                    val_dataset,
+                    eval_dataset,
                     batch_size=args.batch_size,
                     sampler=val_sampler,
                     shuffle=False,
@@ -1154,9 +1246,9 @@ def main():
 
             if args.batch_by_location:
                 val_loader = DataLoader(
-                    val_dataset,
+                    eval_dataset,
                     batch_sampler=LocationBatchSampler(
-                        val_dataset,
+                        eval_dataset,
                         batch_size=args.batch_size,
                         shuffle=False,
                         drop_last=False,
@@ -1166,13 +1258,27 @@ def main():
                 )
             else:
                 val_loader = DataLoader(
-                    val_dataset,
+                    eval_dataset,
                     batch_size=args.batch_size,
                     shuffle=False,
                     **loader_kwargs,
                 )
 
-        mprint(f"Train: {len(train_subset)}, Val: {len(val_dataset)}")
+        mprint(f"Train: {len(train_subset)}, Val(all): {len(val_dataset)}, Eval: {len(eval_dataset)}")
+        if eval_filter_info is not None:
+            mprint(
+                "Eval filter enabled: "
+                f"locations={sorted(eval_locations) if eval_locations else 'ALL'}, "
+                f"types={sorted(eval_location_types) if eval_location_types else 'ALL'}"
+            )
+            mprint(
+                "Eval filter stats: "
+                f"selected_samples={eval_filter_info['selected_samples']}/{eval_filter_info['total_samples']}, "
+                f"selected_locations={len(eval_filter_info['selected_locations'])}/{eval_filter_info['total_locations']}"
+            )
+            selected_locations = eval_filter_info["selected_locations"]
+            if selected_locations:
+                mprint("Eval locations:", ", ".join([str(x) for x in selected_locations]))
 
         # Create model
         model = DIGIR(config).to(device)
