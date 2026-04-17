@@ -55,7 +55,9 @@ class DIGIR(nn.Module):
         self.local_context_extractor = LocalContextExtractor(
             d_model=self.d_model,
             num_heads=config.get('num_heads', 4),
-            dropout=config.get('dropout', 0.1)
+            dropout=config.get('dropout', 0.1),
+            local_topk=int(config.get('local_map_topk', 0)),
+            local_radius=float(config.get('local_map_radius', 0.0)),
         )
 
         # Scene Transformer: global intent pooling
@@ -159,6 +161,10 @@ class DIGIR(nn.Module):
             # Keep tensor shape unchanged so downstream modules are untouched.
             local_contexts = motion_summaries
         else:
+            graph_positions = kg_data['positions']
+            if graph_positions.dim() == 2:
+                graph_positions = graph_positions.unsqueeze(0).expand(batch_size, -1, -1)
+            vehicle_positions = trajectories[:, :, -1, :2]
             graph_embeddings = self.graph_encoder(
                 kg_data['facility_types'],
                 kg_data['positions'],
@@ -166,7 +172,11 @@ class DIGIR(nn.Module):
                 kg_data.get('edge_types')
             )  # (B, M, d)
             local_contexts = self.local_context_extractor(
-                motion_summaries, graph_embeddings, vehicle_mask=vehicle_masks
+                motion_summaries,
+                graph_embeddings,
+                vehicle_mask=vehicle_masks,
+                vehicle_positions=vehicle_positions,
+                graph_positions=graph_positions,
             )  # (B, N, d)
 
         # 4. Global Intent Pooling via Scene Transformer (Eq. 4.6-4.8)
