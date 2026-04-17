@@ -1054,33 +1054,6 @@ def main():
     )
     parser.add_argument("--k", type=int, default=5)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--lambda_fine", type=float, default=1.0, help="Weight for fine-grained diffusion/rule loss.")
-    parser.add_argument("--lambda_coarse", type=float, default=0.5, help="Weight for intent classification loss.")
-    parser.add_argument("--lambda_cross", type=float, default=0.1, help="Weight for cross-granularity KL loss.")
-    parser.add_argument(
-        "--intent_warmup_epochs",
-        type=int,
-        default=8,
-        help="Linearly warm up intent-related losses (lambda_coarse/lambda_cross) over this many epochs. 0 disables.",
-    )
-    parser.add_argument(
-        "--intent_warmup_start_ratio",
-        type=float,
-        default=0.0,
-        help="Initial warmup ratio in [0,1] for intent-related losses at epoch 1.",
-    )
-    parser.add_argument(
-        "--local_map_topk",
-        type=int,
-        default=24,
-        help="Local map attention: each vehicle attends only nearest K map nodes. 0 disables.",
-    )
-    parser.add_argument(
-        "--local_map_radius",
-        type=float,
-        default=0.0,
-        help="Optional local map attention radius (meters). 0 disables.",
-    )
     parser.add_argument("--lambda_rule", type=float, default=1e-3, help="Weight for (L_col + L_map). Set 0 for baseline.")
     parser.add_argument("--map_margin", type=float, default=3.0, help="Meters. L_map penalizes distance beyond this.")
     parser.add_argument(
@@ -1174,19 +1147,13 @@ def main():
             'diffusion_steps': 50,
             'beta_1': 1e-4,
             'beta_T': 5e-2,
-            'lambda_fine': float(args.lambda_fine),
-            'lambda_coarse': float(args.lambda_coarse),
-            'lambda_cross': float(args.lambda_cross),
-            'lambda_coarse_base': float(args.lambda_coarse),
-            'lambda_cross_base': float(args.lambda_cross),
-            'intent_warmup_epochs': int(max(0, args.intent_warmup_epochs)),
-            'intent_warmup_start_ratio': float(max(0.0, min(1.0, args.intent_warmup_start_ratio))),
+            'lambda_fine': 1.0,
+            'lambda_coarse': 0.5,
+            'lambda_cross': 0.1,
             # Rule loss weight (L_col + L_map). Distances are in meters.
             'lambda_rule': float(args.lambda_rule),
             # Map margin (meters) for L_map (distance to road segment beyond this is penalized)
             'map_margin': float(args.map_margin),
-            'local_map_topk': int(max(0, args.local_map_topk)),
-            'local_map_radius': float(max(0.0, args.local_map_radius)),
             'coord_frame': str(args.coord_frame),
             'ablate_cross_attn': bool(args.ablate_cross_attn),
             'ablate_gate': str(args.ablate_gate),
@@ -1208,18 +1175,6 @@ def main():
         mprint(f"DataLoader workers: {int(args.num_workers)}, pin_memory: {bool(args.pin_memory)}")
         mprint(f"Ablate cross-attn: {args.ablate_cross_attn}")
         mprint(f"Ablate gate: {args.ablate_gate}")
-        mprint(
-            f"Loss weights(base): lambda_fine={float(args.lambda_fine):.3g}, "
-            f"lambda_coarse={float(args.lambda_coarse):.3g}, lambda_cross={float(args.lambda_cross):.3g}"
-        )
-        mprint(
-            f"Intent warmup: epochs={int(max(0, args.intent_warmup_epochs))}, "
-            f"start_ratio={float(max(0.0, min(1.0, args.intent_warmup_start_ratio))):.3f}"
-        )
-        mprint(
-            f"Local map attention: topk={int(max(0, args.local_map_topk))}, "
-            f"radius={float(max(0.0, args.local_map_radius)):.3f}"
-        )
         if args.gate_fixed_ratio is not None:
             r = float(max(0.0, min(1.0, float(args.gate_fixed_ratio))))
             mprint(f"Gate fixed ratio: {r:.3f} (interaction={r:.3f}, intent={1.0-r:.3f})")
@@ -1415,29 +1370,6 @@ def main():
 
             mprint(f"\nEpoch {epoch}/{num_epochs}")
             mprint("-" * 70)
-
-            # Intent warmup: gradually introduce coarse/cross losses so the model first
-            # stabilizes kinematic reconstruction before stronger semantic regularization.
-            warmup_epochs = int(max(0, args.intent_warmup_epochs))
-            warmup_start = float(max(0.0, min(1.0, args.intent_warmup_start_ratio)))
-            if warmup_epochs > 0:
-                progress = min(1.0, float(epoch) / float(warmup_epochs))
-                warmup_scale = warmup_start + (1.0 - warmup_start) * progress
-            else:
-                warmup_scale = 1.0
-
-            current_lambda_coarse = float(args.lambda_coarse) * warmup_scale
-            current_lambda_cross = float(args.lambda_cross) * warmup_scale
-            runtime_model = unwrap_model(model)
-            runtime_model.config['lambda_fine'] = float(args.lambda_fine)
-            runtime_model.config['lambda_coarse'] = float(current_lambda_coarse)
-            runtime_model.config['lambda_cross'] = float(current_lambda_cross)
-
-            mprint(
-                f"Loss weights(epoch): lambda_fine={float(args.lambda_fine):.3g}, "
-                f"lambda_coarse={current_lambda_coarse:.3g}, lambda_cross={current_lambda_cross:.3g}, "
-                f"warmup_scale={warmup_scale:.3f}"
-            )
 
             # Train
             train_loss, train_gate_stats = train_epoch(

@@ -88,71 +88,13 @@ class LocalContextExtractor(nn.Module):
     Local context extraction via cross-attention (Section 4.2.2)
     Extracts vehicle-centric local semantic state k_a^t
     """
-    def __init__(self, d_model, num_heads=4, dropout=0.1, local_topk=0, local_radius=0.0):
+    def __init__(self, d_model, num_heads=4, dropout=0.1):
         super().__init__()
         self.cross_attn = CrossAttention(d_model, num_heads, dropout)
         self.norm = nn.LayerNorm(d_model)
         self.dropout = nn.Dropout(dropout)
-        self.local_topk = max(int(local_topk), 0)
-        self.local_radius = max(float(local_radius), 0.0)
 
-    def _build_local_map_mask(self, vehicle_positions, graph_positions, vehicle_mask=None):
-        """
-        Build local map-attention keep mask with shape (B, N, M):
-        1/True means this map node can be attended by this vehicle query.
-        """
-        if vehicle_positions is None or graph_positions is None:
-            return None
-
-        B, N, _ = vehicle_positions.shape
-        if graph_positions.dim() == 2:
-            graph_positions = graph_positions.unsqueeze(0).expand(B, -1, -1)
-        M = graph_positions.shape[1]
-        if M <= 0:
-            return None
-
-        if self.local_topk <= 0 and self.local_radius <= 0.0:
-            return None
-
-        dist = torch.cdist(vehicle_positions.float(), graph_positions.float())  # (B,N,M)
-        keep = torch.ones_like(dist, dtype=torch.bool)
-
-        if self.local_topk > 0:
-            k = min(self.local_topk, M)
-            topk_idx = torch.topk(dist, k=k, dim=-1, largest=False).indices  # (B,N,k)
-            topk_keep = torch.zeros_like(keep)
-            topk_keep.scatter_(-1, topk_idx, True)
-            keep = keep & topk_keep
-
-        if self.local_radius > 0.0:
-            radius_keep = dist <= self.local_radius
-            keep = keep & radius_keep
-
-        # Guarantee at least one valid key per query row to avoid all -inf in softmax.
-        empty_rows = ~keep.any(dim=-1)  # (B,N)
-        if empty_rows.any():
-            nearest = torch.argmin(dist, dim=-1, keepdim=True)  # (B,N,1)
-            fallback = torch.zeros_like(keep)
-            fallback.scatter_(-1, nearest, True)
-            keep = torch.where(empty_rows.unsqueeze(-1), fallback, keep)
-
-        # For padded vehicle queries, keep one default key then zero-out output later.
-        if vehicle_mask is not None:
-            valid = vehicle_mask.bool().unsqueeze(-1)  # (B,N,1)
-            default_keep = torch.zeros_like(keep)
-            default_keep[..., 0] = True
-            keep = torch.where(valid, keep, default_keep)
-
-        return keep
-
-    def forward(
-        self,
-        vehicle_state,
-        graph_embeddings,
-        vehicle_mask=None,
-        vehicle_positions=None,
-        graph_positions=None,
-    ):
+    def forward(self, vehicle_state, graph_embeddings, vehicle_mask=None):
         """
         Args:
             vehicle_state: (batch_size, N, d_model) - motion summary s_a^t
@@ -166,14 +108,8 @@ class LocalContextExtractor(nn.Module):
         Q = vehicle_state  # (B, N, d)
         K = V = graph_embeddings  # (B, M, d)
 
-        local_mask = self._build_local_map_mask(
-            vehicle_positions=vehicle_positions,
-            graph_positions=graph_positions,
-            vehicle_mask=vehicle_mask,
-        )
-
         # Cross-attention
-        attn_out, _ = self.cross_attn(Q, K, V, mask=local_mask)  # (B, N, d)
+        attn_out, _ = self.cross_attn(Q, K, V)  # (B, N, d)
 
         # Residual connection and layer norm
         local_context = self.norm(vehicle_state + self.dropout(attn_out))
