@@ -56,7 +56,17 @@ class CrossAttention(nn.Module):
         scores = torch.matmul(Q, K.transpose(-2, -1)) / self.scale  # (B, num_heads, seq_q, seq_k)
 
         if mask is not None:
-            scores = scores.masked_fill(mask == 0, -1e9)
+            # Supported mask formats:
+            # - (B, seq_k): key-valid mask, 1/True = keep, 0/False = mask out
+            # - (B, seq_q, seq_k): pair-wise mask
+            # - (B, 1, seq_q, seq_k) or (B, num_heads, seq_q, seq_k): pre-expanded
+            if mask.dim() == 2:
+                m = mask[:, None, None, :]
+            elif mask.dim() == 3:
+                m = mask[:, None, :, :]
+            else:
+                m = mask
+            scores = scores.masked_fill(m == 0, -1e9)
 
         attention_weights = torch.softmax(scores, dim=-1)
         attention_weights = self.dropout(attention_weights)
@@ -84,7 +94,7 @@ class LocalContextExtractor(nn.Module):
         self.norm = nn.LayerNorm(d_model)
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, vehicle_state, graph_embeddings):
+    def forward(self, vehicle_state, graph_embeddings, vehicle_mask=None):
         """
         Args:
             vehicle_state: (batch_size, N, d_model) - motion summary s_a^t
@@ -103,6 +113,8 @@ class LocalContextExtractor(nn.Module):
 
         # Residual connection and layer norm
         local_context = self.norm(vehicle_state + self.dropout(attn_out))
+        if vehicle_mask is not None:
+            local_context = local_context * vehicle_mask.unsqueeze(-1).float()
 
         return local_context
 
@@ -139,7 +151,7 @@ class IntentPriorQuery(nn.Module):
         # Project back to d_model if needed
         self.output_proj = nn.Linear(self.d_prior, d_model) if self.d_prior != d_model else nn.Identity()
 
-    def forward(self, local_context, scene_intent):
+    def forward(self, local_context, scene_intent, vehicle_mask=None):
         """
         Args:
             local_context: (batch_size, N, d_model) - k_a^t
@@ -154,7 +166,7 @@ class IntentPriorQuery(nn.Module):
 
         # Cross-attention: query scene intent with vehicle context
         attn_out, _ = self.cross_attn(Q, K, V)  # (B, N, d_p)
-        attn_out = self.norm1(attn_out + self.dropout(attn_out))
+        attn_out = self.norm1(Q + self.dropout(attn_out))
 
         # FFN
         ffn_out = self.ffn(attn_out)
@@ -163,5 +175,7 @@ class IntentPriorQuery(nn.Module):
         # Project back and residual with local context
         intent_prior = self.output_proj(intent_prior)
         intent_prior = self.norm2(local_context + self.dropout(intent_prior))
+        if vehicle_mask is not None:
+            intent_prior = intent_prior * vehicle_mask.unsqueeze(-1).float()
 
         return intent_prior

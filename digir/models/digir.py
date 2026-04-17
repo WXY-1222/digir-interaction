@@ -129,7 +129,7 @@ class DIGIR(nn.Module):
             nn.Linear(self.d_model // 2, self.num_intent_classes)
         )
 
-    def encode_scene(self, trajectories, kg_data):
+    def encode_scene(self, trajectories, kg_data, vehicle_masks=None):
         """
         Scene-level semantic intent construction (Section 4.2)
 
@@ -150,6 +150,8 @@ class DIGIR(nn.Module):
 
         # 1. Encode trajectories (Eq. 4.2)
         motion_summaries = self.traj_encoder(trajectories)  # (B, N, d)
+        if vehicle_masks is not None:
+            motion_summaries = motion_summaries * vehicle_masks.unsqueeze(-1).float()
 
         # 2-3. Encode Knowledge Graph + Local Context Extraction via Cross-Attention (Eq. 4.3-4.5)
         if self.ablate_cross_attn:
@@ -164,15 +166,18 @@ class DIGIR(nn.Module):
                 kg_data.get('edge_types')
             )  # (B, M, d)
             local_contexts = self.local_context_extractor(
-                motion_summaries, graph_embeddings
+                motion_summaries, graph_embeddings, vehicle_mask=vehicle_masks
             )  # (B, N, d)
 
         # 4. Global Intent Pooling via Scene Transformer (Eq. 4.6-4.8)
-        scene_intent, _ = self.scene_transformer(local_contexts)  # (B, d)
+        scene_intent, local_contexts = self.scene_transformer(
+            local_contexts,
+            vehicle_mask=vehicle_masks,
+        )  # (B, d), (B, N, d)
 
         return scene_intent, local_contexts, motion_summaries
 
-    def cross_granularity_mapping(self, scene_intent, local_contexts):
+    def cross_granularity_mapping(self, scene_intent, local_contexts, vehicle_masks=None):
         """
         Cross-granularity prior mapping (Section 4.3)
 
@@ -188,14 +193,18 @@ class DIGIR(nn.Module):
         scene_expanded = scene_intent.unsqueeze(1)  # (B, 1, d)
 
         # Intent Prior Querying (Eq. 4.11, 4.12)
-        intent_priors = self.intent_query(local_contexts, scene_expanded)  # (B, N, d)
+        intent_priors = self.intent_query(
+            local_contexts,
+            scene_expanded,
+            vehicle_mask=vehicle_masks,
+        )  # (B, N, d)
 
         # Intent Classification (Eq. 4.13)
         intent_logits = self.intent_classifier(intent_priors)  # (B, N, C)
 
         return intent_priors, intent_logits
 
-    def agent_level_modeling(self, motion_summaries, intent_priors):
+    def agent_level_modeling(self, motion_summaries, intent_priors, vehicle_masks=None):
         """
         Agent-level interaction and fusion (Section 4.4)
 
@@ -209,7 +218,10 @@ class DIGIR(nn.Module):
             gate_weights: (batch_size, N, d) or (B, N, 1) - g_a^t
         """
         # 1. V2V Micro-Dynamic Interaction (Eq. 4.14, 4.15)
-        interaction_features = self.v2v_interaction(motion_summaries)  # (B, N, d)
+        interaction_features = self.v2v_interaction(
+            motion_summaries,
+            vehicle_mask=vehicle_masks,
+        )  # (B, N, d)
 
         # 2. Gated Fusion (Eq. 4.16, 4.17) + optional ablations
         if self.gate_fixed_ratio is not None:
@@ -229,6 +241,12 @@ class DIGIR(nn.Module):
             fused_conditions, gate_weights = self.gated_fusion(
                 interaction_features, intent_priors
             )  # (B, N, d) / gate: (B,N,d) or (B,N,1)
+
+        if vehicle_masks is not None:
+            vm = vehicle_masks.unsqueeze(-1).float()
+            fused_conditions = fused_conditions * vm
+            interaction_features = interaction_features * vm
+            gate_weights = gate_weights * vm
 
         return fused_conditions, interaction_features, gate_weights
 
@@ -250,17 +268,23 @@ class DIGIR(nn.Module):
 
         # ============ Scene-Level Intent Construction ============
         scene_intent, local_contexts, motion_summaries = self.encode_scene(
-            trajectories, kg_data
+            trajectories,
+            kg_data,
+            vehicle_masks=vehicle_masks,
         )
 
         # ============ Cross-Granularity Mapping ============
         intent_priors, intent_logits = self.cross_granularity_mapping(
-            scene_intent, local_contexts
+            scene_intent,
+            local_contexts,
+            vehicle_masks=vehicle_masks,
         )
 
         # ============ Agent-Level Modeling ============
         fused_conditions, interaction_features, gate_weights = self.agent_level_modeling(
-            motion_summaries, intent_priors
+            motion_summaries,
+            intent_priors,
+            vehicle_masks=vehicle_masks,
         )
 
         outputs = {
@@ -305,7 +329,7 @@ class DIGIR(nn.Module):
         return outputs
 
     def generate(self, trajectories, kg_data, num_points=12, num_samples=20,
-                 sampling="ddim", step=20, bestof=True):
+                 sampling="ddim", step=20, bestof=True, vehicle_masks=None):
         """
         Generate future trajectory predictions
 
@@ -325,17 +349,23 @@ class DIGIR(nn.Module):
 
         # Encode scene
         scene_intent, local_contexts, motion_summaries = self.encode_scene(
-            trajectories, kg_data
+            trajectories,
+            kg_data,
+            vehicle_masks=vehicle_masks,
         )
 
         # Cross-granularity mapping
         intent_priors, intent_logits = self.cross_granularity_mapping(
-            scene_intent, local_contexts
+            scene_intent,
+            local_contexts,
+            vehicle_masks=vehicle_masks,
         )
 
         # Agent-level modeling
         fused_conditions, _, _ = self.agent_level_modeling(
-            motion_summaries, intent_priors
+            motion_summaries,
+            intent_priors,
+            vehicle_masks=vehicle_masks,
         )
 
         # Generate trajectories with diffusion
@@ -509,7 +539,17 @@ class DIGIR(nn.Module):
         posterior_probs = posterior_probs.clamp(min=eps)
         posterior_probs = posterior_probs / posterior_probs.sum(dim=-1, keepdim=True)
 
-        loss_cross = F.kl_div(prior_log_probs, posterior_probs, reduction='batchmean')
+        valid_cross = intent_labels_flat != -1
+        if vehicle_masks is not None:
+            valid_cross = valid_cross & vehicle_masks.reshape(-1).bool()
+        if valid_cross.any():
+            loss_cross = F.kl_div(
+                prior_log_probs[valid_cross],
+                posterior_probs[valid_cross],
+                reduction='batchmean',
+            )
+        else:
+            loss_cross = torch.tensor(0.0, device=intent_logits_flat.device, dtype=intent_logits_flat.dtype)
 
         # Total loss (Eq. 4.24)
         lambda_1 = self.config.get('lambda_fine', 1.0)

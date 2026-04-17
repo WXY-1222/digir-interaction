@@ -36,7 +36,7 @@ class V2VInteraction(nn.Module):
 
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, kinematic_features):
+    def forward(self, kinematic_features, vehicle_mask=None):
         """
         Args:
             kinematic_features: (batch_size, N, d_model) - S^t = [s_1^t, ..., s_N^t]
@@ -44,16 +44,22 @@ class V2VInteraction(nn.Module):
             interaction_features: (batch_size, N, d_model) - u_a^t
         """
         x = kinematic_features
+        key_padding_mask = None
+        if vehicle_mask is not None:
+            key_padding_mask = ~vehicle_mask.bool()
+            x = x * vehicle_mask.unsqueeze(-1).float()
 
         # Apply multiple attention layers
         for i in range(len(self.attention_layers)):
             # Self-attention
-            attn_out, _ = self.attention_layers[i](x, x, x)
+            attn_out, _ = self.attention_layers[i](x, x, x, key_padding_mask=key_padding_mask, need_weights=False)
             x = self.norm1_layers[i](x + self.dropout(attn_out))
 
             # FFN
             ffn_out = self.ffn_layers[i](x)
             x = self.norm2_layers[i](x + self.dropout(ffn_out))
+            if vehicle_mask is not None:
+                x = x * vehicle_mask.unsqueeze(-1).float()
 
         return x  # u_a^t
 

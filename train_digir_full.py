@@ -707,7 +707,8 @@ def evaluate(
                 num_samples=1,
                 sampling="ddim",
                 step=10,
-                bestof=False
+                bestof=False,
+                vehicle_masks=vehicle_masks,
             )
             pred_trajs_k.append(_normalize_pred_shape(pred))
 

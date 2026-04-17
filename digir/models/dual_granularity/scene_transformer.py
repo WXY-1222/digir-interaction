@@ -32,7 +32,7 @@ class SceneTransformer(nn.Module):
         # Layer normalization
         self.norm = nn.LayerNorm(d_model)
 
-    def forward(self, local_contexts):
+    def forward(self, local_contexts, vehicle_mask=None):
         """
         Args:
             local_contexts: (batch_size, N, d_model) - k_1^t, ..., k_N^t
@@ -48,14 +48,21 @@ class SceneTransformer(nn.Module):
         # Prepend scene token to local contexts
         sequence = torch.cat([scene_token, local_contexts], dim=1)  # (B, N+1, d)
 
-        # Apply transformer
-        transformed = self.transformer(sequence)  # (B, N+1, d)
+        # Apply transformer with optional key padding mask.
+        src_key_padding_mask = None
+        if vehicle_mask is not None:
+            pad_mask = (~vehicle_mask.bool())
+            cls_mask = torch.zeros(batch_size, 1, dtype=torch.bool, device=local_contexts.device)
+            src_key_padding_mask = torch.cat([cls_mask, pad_mask], dim=1)  # (B, N+1)
+        transformed = self.transformer(sequence, src_key_padding_mask=src_key_padding_mask)  # (B, N+1, d)
 
         # Extract scene intent from first position
         scene_intent = transformed[:, 0, :]  # (B, d)
 
         # Extract updated local contexts (optional, for downstream use)
         updated_contexts = transformed[:, 1:, :]  # (B, N, d)
+        if vehicle_mask is not None:
+            updated_contexts = updated_contexts * vehicle_mask.unsqueeze(-1).float()
 
         scene_intent = self.norm(scene_intent)
 
@@ -76,7 +83,7 @@ class SceneIntentPooler(nn.Module):
             dropout=dropout
         )
 
-    def forward(self, local_contexts):
+    def forward(self, local_contexts, vehicle_mask=None):
         """
         Args:
             local_contexts: (batch_size, N, d_model) - from cross-attention
@@ -84,5 +91,5 @@ class SceneIntentPooler(nn.Module):
             scene_intent: (batch_size, d_model) - z_scene^t
             vehicle_features: (batch_size, N, d_model) - updated features
         """
-        scene_intent, vehicle_features = self.scene_transformer(local_contexts)
+        scene_intent, vehicle_features = self.scene_transformer(local_contexts, vehicle_mask=vehicle_mask)
         return scene_intent, vehicle_features
