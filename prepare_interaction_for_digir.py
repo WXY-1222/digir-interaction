@@ -261,7 +261,15 @@ def compute_intent_label(track_data, num_history=8, num_future=12):
         return 3  # Other
 
 
-def process_interaction_file(csv_path, kg_data, location_name=None, hist_len=8, future_len=12, min_speed=0.3):
+def process_interaction_file(
+    csv_path,
+    kg_data,
+    location_name=None,
+    hist_len=8,
+    future_len=12,
+    min_speed=0.3,
+    window_stride=5,
+):
     """
     处理单个 INTERACTION CSV 文件
 
@@ -290,7 +298,8 @@ def process_interaction_file(csv_path, kg_data, location_name=None, hist_len=8, 
             continue
 
         # 滑动窗口提取样本
-        for start_idx in range(0, len(common_frames) - hist_len - future_len + 1, 10):
+        stride = max(1, int(window_stride))
+        for start_idx in range(0, len(common_frames) - hist_len - future_len + 1, stride):
             hist_frames = common_frames[start_idx:start_idx + hist_len]
             future_frames = common_frames[start_idx + hist_len:start_idx + hist_len + future_len]
 
@@ -375,6 +384,7 @@ def main():
     parser.add_argument('--output_dir', type=str, default='./digir_data', help='Output directory')
     parser.add_argument('--hist_len', type=int, default=8, help='History length')
     parser.add_argument('--future_len', type=int, default=12, help='Prediction horizon')
+    parser.add_argument('--window_stride', type=int, default=5, help='Sliding window stride')
     parser.add_argument('--max_nodes', type=int, default=50, help='Max map nodes kept per location KG')
     parser.add_argument(
         '--facility_mode',
@@ -440,7 +450,7 @@ def main():
         # 处理训练数据
         print(f"  Processing training data...")
         train_samples = process_interaction_file(
-            str(train_file), kg_data, location_name, args.hist_len, args.future_len
+            str(train_file), kg_data, location_name, args.hist_len, args.future_len, window_stride=args.window_stride
         )
         all_train_samples.extend(train_samples)
         print(f"    Generated {len(train_samples)} samples")
@@ -449,7 +459,7 @@ def main():
         if val_file.exists():
             print(f"  Processing validation data...")
             val_samples = process_interaction_file(
-                str(val_file), kg_data, location_name, args.hist_len, args.future_len
+                str(val_file), kg_data, location_name, args.hist_len, args.future_len, window_stride=args.window_stride
             )
             all_val_samples.extend(val_samples)
             print(f"    Generated {len(val_samples)} samples")
@@ -486,6 +496,7 @@ def main():
         'config': {
             'hist_len': args.hist_len,
             'future_len': args.future_len,
+            'window_stride': args.window_stride,
             'num_intent_classes': 4,
             'input_dim': 4,
             'output_dim': 2,
@@ -498,13 +509,14 @@ def main():
     if args.output_name:
         out_name = args.output_name
     else:
+        stride_suffix = f"_s{args.window_stride}"
         if location_filter and len(location_filter) == 1:
             loc = next(iter(location_filter))
-            out_name = f"interaction_digir_{loc}_h{args.hist_len}_f{args.future_len}.pkl"
+            out_name = f"interaction_digir_{loc}_h{args.hist_len}_f{args.future_len}{stride_suffix}.pkl"
         elif location_filter and len(location_filter) > 1:
-            out_name = f"interaction_digir_{len(location_filter)}loc_h{args.hist_len}_f{args.future_len}.pkl"
+            out_name = f"interaction_digir_{len(location_filter)}loc_h{args.hist_len}_f{args.future_len}{stride_suffix}.pkl"
         else:
-            out_name = "interaction_digir.pkl"
+            out_name = f"interaction_digir{stride_suffix}.pkl"
 
     output_path = os.path.join(args.output_dir, out_name)
     with open(output_path, 'wb') as f:
@@ -512,6 +524,7 @@ def main():
 
     print(f"\n{'='*50}")
     print(f"Dataset saved to: {output_path}")
+    print(f"Window stride: {args.window_stride}")
     print(f"KG nodes: {default_kg['num_nodes']}")
     print(f"KG edges: {default_kg['num_edges']}")
     print("✓ Ready for DIGIR training!")
