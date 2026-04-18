@@ -556,6 +556,7 @@ def evaluate(
     dataloader,
     device,
     num_samples=5,
+    sample_step=10,
     miss_threshold=2.0,
     max_batches=20,
     coord_frame=COORD_PER_AGENT,
@@ -706,7 +707,7 @@ def evaluate(
                 num_points=12,
                 num_samples=1,
                 sampling="ddim",
-                step=10,
+                step=max(1, int(sample_step)),
                 bestof=False,
                 vehicle_masks=vehicle_masks,
             )
@@ -1053,8 +1054,16 @@ def main():
         "Supported: intersection,roundabout,merging,lanechange,other",
     )
     parser.add_argument("--k", type=int, default=5)
+    parser.add_argument(
+        "--sample_step",
+        type=int,
+        default=10,
+        help="Diffusion sampling stride for eval generation and rule-loss sampling. Smaller can improve metrics but is slower.",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--lambda_rule", type=float, default=1e-3, help="Weight for (L_col + L_map). Set 0 for baseline.")
+    parser.add_argument("--lambda_coarse", type=float, default=0.5, help="Weight for intent classification loss (L_coarse).")
+    parser.add_argument("--lambda_cross", type=float, default=0.1, help="Weight for cross-granularity KL loss (L_cross).")
     parser.add_argument("--map_margin", type=float, default=3.0, help="Meters. L_map penalizes distance beyond this.")
     parser.add_argument(
         "--ablate_cross_attn",
@@ -1148,10 +1157,12 @@ def main():
             'beta_1': 1e-4,
             'beta_T': 5e-2,
             'lambda_fine': 1.0,
-            'lambda_coarse': 0.5,
-            'lambda_cross': 0.1,
+            'lambda_coarse': float(args.lambda_coarse),
+            'lambda_cross': float(args.lambda_cross),
             # Rule loss weight (L_col + L_map). Distances are in meters.
             'lambda_rule': float(args.lambda_rule),
+            # Diffusion sample stride used in eval generation and rule-loss sampling.
+            'sample_step': max(1, int(args.sample_step)),
             # Map margin (meters) for L_map (distance to road segment beyond this is penalized)
             'map_margin': float(args.map_margin),
             'coord_frame': str(args.coord_frame),
@@ -1170,7 +1181,14 @@ def main():
         mprint(f"DIGIR root: {os.path.abspath(os.path.expanduser(args.digir_root)) if args.digir_root else '(from PYTHONPATH)'}")
         mprint(f"Data path: {args.data}")
         mprint(f"Save path: {args.save}")
-        mprint(f"Model config: d_model={config['d_model']}, diffusion_steps={config['diffusion_steps']}")
+        mprint(
+            f"Model config: d_model={config['d_model']}, diffusion_steps={config['diffusion_steps']}, "
+            f"sample_step={config['sample_step']}"
+        )
+        mprint(
+            f"Loss weights: lambda_rule={config['lambda_rule']:.3g}, "
+            f"lambda_coarse={config['lambda_coarse']:.3g}, lambda_cross={config['lambda_cross']:.3g}"
+        )
         mprint(f"Coordinate frame: {args.coord_frame}")
         mprint(f"DataLoader workers: {int(args.num_workers)}, pin_memory: {bool(args.pin_memory)}")
         mprint(f"Ablate cross-attn: {args.ablate_cross_attn}")
@@ -1403,6 +1421,7 @@ def main():
                 val_loader,
                 device,
                 num_samples=args.k,
+                sample_step=args.sample_step,
                 max_batches=args.eval_batches,
                 coord_frame=args.coord_frame,
                 log_gate_stats=args.log_gate_stats,

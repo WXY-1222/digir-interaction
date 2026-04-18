@@ -315,13 +315,14 @@ class DIGIR(nn.Module):
             # Only do this when rule loss is enabled to avoid extra compute for baseline.
             lambda_rule = self.config.get('lambda_rule', 0.0)
             if lambda_rule and float(lambda_rule) > 0.0:
+                sample_step = max(1, int(self.config.get('sample_step', 10)))
                 with torch.no_grad():
                     samples = self.diffusion.sample(
                         num_points=self.prediction_horizon,
                         context=condition_flat,
                         num_samples=1,
                         sampling="ddim",
-                        step=10,
+                        step=sample_step,
                     )  # (1, B*N, T, 2)
                     samples = samples[0].view(batch_size, N, self.prediction_horizon, 2)
                 outputs['traj_pred_train'] = samples
