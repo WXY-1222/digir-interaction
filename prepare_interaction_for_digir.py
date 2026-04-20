@@ -17,6 +17,30 @@ from collections import defaultdict
 import xml.etree.ElementTree as ET
 
 
+def estimate_case_frame_bounds(csv_paths):
+    """
+    Estimate min/max number of unique frames per case across csv files.
+    """
+    min_frames = None
+    max_frames = 0
+
+    for csv_path in csv_paths:
+        if not os.path.exists(csv_path):
+            continue
+        df = pd.read_csv(csv_path, usecols=['case_id', 'frame_id'])
+        per_case = df.groupby('case_id')['frame_id'].nunique()
+        if len(per_case) == 0:
+            continue
+        cur_min = int(per_case.min())
+        cur_max = int(per_case.max())
+        min_frames = cur_min if min_frames is None else min(min_frames, cur_min)
+        max_frames = max(max_frames, cur_max)
+
+    if min_frames is None:
+        min_frames = 0
+    return min_frames, max_frames
+
+
 def parse_osm_map(osm_path, max_nodes=50, facility_mode='coarse'):
     """
     解析 OSM 地图文件，构建知识图
@@ -385,6 +409,7 @@ def main():
     parser.add_argument('--hist_len', type=int, default=8, help='History length')
     parser.add_argument('--future_len', type=int, default=12, help='Prediction horizon')
     parser.add_argument('--window_stride', type=int, default=5, help='Sliding window stride')
+    parser.add_argument('--fps', type=float, default=10.0, help='Dataset frame rate (Hz), used for time reporting')
     parser.add_argument('--max_nodes', type=int, default=50, help='Max map nodes kept per location KG')
     parser.add_argument(
         '--facility_mode',
@@ -427,6 +452,35 @@ def main():
     all_train_samples = []
     all_val_samples = []
     kg_data_per_location = {}
+
+    # Validate requested window against raw case length to fail fast with a clear message.
+    selected_train_files = []
+    selected_val_files = []
+    for train_file in train_files:
+        location_name = train_file.stem.replace('_train', '')
+        if location_filter is not None and location_name not in location_filter:
+            continue
+        selected_train_files.append(str(train_file))
+        val_file = val_dir / f"{location_name}_val.csv"
+        if val_file.exists():
+            selected_val_files.append(str(val_file))
+
+    required_frames = int(args.hist_len + args.future_len)
+    min_case_frames, max_case_frames = estimate_case_frame_bounds(selected_train_files + selected_val_files)
+    if max_case_frames > 0 and required_frames > max_case_frames:
+        max_future = max(0, max_case_frames - int(args.hist_len))
+        raise ValueError(
+            f"Requested hist_len+future_len={required_frames} exceeds available case frames={max_case_frames}. "
+            f"With hist_len={args.hist_len}, max feasible future_len is {max_future}. "
+            f"(At fps={args.fps:g}, this is up to history={args.hist_len/args.fps:.2f}s, "
+            f"future={max_future/args.fps:.2f}s.)"
+        )
+
+    print(
+        f"Configured horizon: history={args.hist_len} frames ({args.hist_len/args.fps:.2f}s), "
+        f"future={args.future_len} frames ({args.future_len/args.fps:.2f}s), "
+        f"required total={required_frames} frames, available per-case=[{min_case_frames}, {max_case_frames}]"
+    )
 
     # 处理每个地点的训练文件
     for train_file in train_files:

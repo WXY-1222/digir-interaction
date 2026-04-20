@@ -1206,6 +1206,21 @@ def main():
         train_dataset = InteractionDatasetForDIGIR(data_path, split='train', max_vehicles=10)
         val_dataset = InteractionDatasetForDIGIR(data_path, split='val', max_vehicles=10)
         eval_dataset = val_dataset
+
+        # Infer temporal dimensions from dataset (supports h10/f30 etc. without code edits).
+        ds_cfg = train_dataset.config if isinstance(train_dataset.config, dict) else {}
+        hist_len_ds = ds_cfg.get("hist_len", None)
+        future_len_ds = ds_cfg.get("future_len", None)
+        if hist_len_ds is None or future_len_ds is None:
+            sample0 = train_dataset.samples[0]
+            hist_len_ds = int(sample0["trajectory"].shape[1])
+            future_len_ds = int(sample0["future_trajectory"].shape[1])
+        config["hist_len"] = int(hist_len_ds)
+        config["prediction_horizon"] = int(future_len_ds)
+        mprint(
+            f"Temporal setup (from data): hist_len={config['hist_len']} frames, "
+            f"future_len={config['prediction_horizon']} frames"
+        )
         eval_filter_info = None
         if eval_locations or eval_location_types:
             eval_dataset, eval_filter_info = filter_dataset_by_location(
