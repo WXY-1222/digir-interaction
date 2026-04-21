@@ -700,11 +700,14 @@ def evaluate(
         vehicle_widths = torch.full((N,), 1.8, device=device)   # meters
 
         # ===== 1. Generate K samples for minADE/minFDE =====
+        # Keep generation horizon consistent with current dataset target length.
+        # This is required for configs like h10/f30 (1s->3s) where T != 12.
+        pred_horizon = int(future_local.shape[2])
         pred_trajs_k = []
         for _ in range(num_samples):
             pred = base_model.generate(
                 trajectories_norm, kg_data,
-                num_points=12,
+                num_points=pred_horizon,
                 num_samples=1,
                 sampling="ddim",
                 step=max(1, int(sample_step)),
