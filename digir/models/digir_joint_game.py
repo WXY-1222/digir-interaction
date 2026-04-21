@@ -242,12 +242,26 @@ class DIGIR(BaseDIGIR):
             valid_q = torch.ones((b, nk), dtype=torch.bool, device=q_flat.device)
         else:
             valid_q = vehicle_masks.unsqueeze(-1).expand(-1, -1, k).reshape(b, nk).bool()
-        key_padding_mask = ~valid_q
 
         attn_bias = self._build_conflict_attn_bias(pre_end, num_heads=nhead)
+        # Merge key-padding behavior into additive attn bias to avoid mixed-mask dtype warnings.
+        # invalid keys get a very negative score so they are ignored by softmax.
+        if attn_bias is None:
+            attn_bias = torch.zeros(
+                (b * nhead, nk, nk), dtype=q_flat.dtype, device=q_flat.device
+            )
+        else:
+            attn_bias = attn_bias.to(dtype=q_flat.dtype)
+        invalid_key_bias = (~valid_q).to(dtype=q_flat.dtype).unsqueeze(1).unsqueeze(1) * (-1e4)
+        attn_bias = (
+            attn_bias.view(b, nhead, nk, nk) + invalid_key_bias
+        ).reshape(b * nhead, nk, nk)
+
+        # Keep invalid query tokens inert.
+        q_flat = q_flat * valid_q.unsqueeze(-1).to(dtype=q_flat.dtype)
+
         q_attn, _ = self.joint_attn(
             q_flat, q_flat, q_flat,
-            key_padding_mask=key_padding_mask,
             attn_mask=attn_bias,
             need_weights=False,
         )
@@ -265,7 +279,8 @@ class DIGIR(BaseDIGIR):
         if vehicle_masks is not None:
             invalid = (~vehicle_masks.bool()).unsqueeze(-1).expand_as(mode_logits)
             mode_logits = mode_logits.masked_fill(invalid, -1e4)
-            traj_modes = traj_modes * vehicle_masks.unsqueeze(-1).unsqueeze(-1).float()
+            # Explicit 5D broadcast: (B,N,1,1,1) aligns with (B,N,K,T,2).
+            traj_modes = traj_modes * vehicle_masks.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1).float()
 
         return traj_modes, mode_logits
 
@@ -382,4 +397,3 @@ class DIGIR(BaseDIGIR):
             idx = self._sample_mode_index(mode_logits, bestof=False)
             preds.append(self._gather_mode(traj_modes, idx))
         return torch.stack(preds, dim=0)
-
