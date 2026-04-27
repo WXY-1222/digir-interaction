@@ -1023,6 +1023,18 @@ def main():
     )
     parser.add_argument("--data", type=str, default="./digir_data/interaction_digir.pkl")
     parser.add_argument("--save", type=str, default="./digir_interaction_best.pt")
+    parser.add_argument(
+        "--resume",
+        type=str,
+        default="",
+        help="Optional checkpoint path to resume from. Supports latest checkpoints and older best-model files.",
+    )
+    parser.add_argument(
+        "--save_latest",
+        type=str,
+        default="",
+        help="Optional path for the latest resumable checkpoint. Defaults to <save> with '_latest' suffix.",
+    )
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--num_workers", type=int, default=4, help="DataLoader worker processes per rank.")
@@ -1111,6 +1123,13 @@ def main():
 
     args.data = resolve_rooted_path(args.data, args.data_root)
     args.save = resolve_rooted_path(args.save, args.save_root)
+    if args.resume:
+        args.resume = resolve_rooted_path(args.resume, args.save_root)
+    if args.save_latest:
+        args.save_latest = resolve_rooted_path(args.save_latest, args.save_root)
+    else:
+        save_base, save_ext = os.path.splitext(args.save)
+        args.save_latest = f"{save_base}_latest{save_ext or '.pt'}"
     eval_locations = parse_csv_set(args.eval_locations, lower=False)
     eval_location_types = parse_csv_set(args.eval_location_types, lower=True)
     supported_eval_types = {"intersection", "roundabout", "merging", "lanechange", "other"}
@@ -1133,6 +1152,9 @@ def main():
         save_dir = os.path.dirname(os.path.abspath(args.save))
         if save_dir:
             os.makedirs(save_dir, exist_ok=True)
+        latest_dir = os.path.dirname(os.path.abspath(args.save_latest))
+        if latest_dir:
+            os.makedirs(latest_dir, exist_ok=True)
 
         # Reproducibility
         random.seed(args.seed)
@@ -1184,6 +1206,9 @@ def main():
         mprint(f"DIGIR root: {os.path.abspath(os.path.expanduser(args.digir_root)) if args.digir_root else '(from PYTHONPATH)'}")
         mprint(f"Data path: {args.data}")
         mprint(f"Save path: {args.save}")
+        mprint(f"Latest checkpoint path: {args.save_latest}")
+        if args.resume:
+            mprint(f"Resume checkpoint: {args.resume}")
         mprint(
             f"Model config: d_model={config['d_model']}, diffusion_steps={config['diffusion_steps']}, "
             f"sample_step={config['sample_step']}"
@@ -1389,12 +1414,53 @@ def main():
         # Training
         num_epochs = args.epochs
         best_ade = float('inf')
+        start_epoch = 1
+
+        if args.resume:
+            if not os.path.exists(args.resume):
+                raise FileNotFoundError(f"Resume checkpoint not found: {args.resume}")
+            checkpoint = torch.load(args.resume, map_location=device)
+            model_state = checkpoint.get("model", checkpoint)
+            unwrap_model(model).load_state_dict(model_state)
+            if "optimizer" in checkpoint:
+                optimizer.load_state_dict(checkpoint["optimizer"])
+            else:
+                mprint("  [!] Resume checkpoint has no optimizer state; optimizer is reinitialized.")
+            if "scheduler" in checkpoint:
+                scheduler.load_state_dict(checkpoint["scheduler"])
+            else:
+                mprint("  [!] Resume checkpoint has no scheduler state; scheduler is reinitialized.")
+
+            start_epoch = int(checkpoint.get("epoch", 0)) + 1
+            if "best_ade" in checkpoint:
+                best_ade = float(checkpoint["best_ade"])
+            elif isinstance(checkpoint.get("metrics", None), dict) and "minADE_5" in checkpoint["metrics"]:
+                best_ade = float(checkpoint["metrics"]["minADE_5"])
+
+            mprint(
+                f"  [*] Resumed from epoch {start_epoch - 1}; "
+                f"next epoch={start_epoch}, best minADE={best_ade:.3f}"
+            )
+
+        def save_latest_checkpoint(epoch: int):
+            if not is_main:
+                return
+            torch.save({
+                'epoch': epoch,
+                'model': unwrap_model(model).state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'scheduler': scheduler.state_dict(),
+                'config': config,
+                'best_ade': best_ade,
+                'args': vars(args),
+            }, args.save_latest)
+            mprint(f"  [*] Latest checkpoint saved: {args.save_latest}")
 
         mprint("\n" + "=" * 70)
         mprint("Starting Training")
         mprint("=" * 70)
 
-        for epoch in range(1, num_epochs + 1):
+        for epoch in range(start_epoch, num_epochs + 1):
             if train_sampler is not None:
                 train_sampler.set_epoch(epoch)
             if train_batch_sampler is not None and hasattr(train_batch_sampler, "set_epoch"):
@@ -1432,6 +1498,9 @@ def main():
             if not should_eval:
                 mprint(f"Skip eval at epoch {epoch} (eval_every={int(args.eval_every)})")
                 scheduler.step()
+                save_latest_checkpoint(epoch)
+                if is_distributed:
+                    dist.barrier()
                 continue
 
             metrics = evaluate(
@@ -1495,6 +1564,9 @@ def main():
                 dist.barrier()
 
             scheduler.step()
+            save_latest_checkpoint(epoch)
+            if is_distributed:
+                dist.barrier()
 
         mprint("\n" + "=" * 70)
         mprint("Training Completed!")
