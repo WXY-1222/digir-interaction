@@ -64,6 +64,26 @@ def parse_csv_set(raw: str, *, lower: bool = False):
     return set(items)
 
 
+def apply_motion_feature_ablation(trajectories: torch.Tensor, motion_features: str) -> torch.Tensor:
+    """
+    Keep model input shape stable while controlling which motion channels are visible.
+
+    Current INTERACTION pkl stores historical states as [x, y, heading, speed].
+    For fair "x,y + map only" experiments, motion_features=xy masks heading/speed
+    to zero instead of changing model dimensions.
+    """
+    if motion_features == "xyhs":
+        return trajectories
+    if motion_features != "xy":
+        raise ValueError(f"Unsupported motion_features={motion_features!r}")
+
+    if trajectories.shape[-1] <= 2:
+        return trajectories
+    trajectories_xy = trajectories.clone()
+    trajectories_xy[..., 2:] = 0.0
+    return trajectories_xy
+
+
 def infer_location_type(location_name):
     key = str(location_name or "").lower()
     if "intersection" in key:
@@ -560,6 +580,7 @@ def evaluate(
     miss_threshold=2.0,
     max_batches=20,
     coord_frame=COORD_PER_AGENT,
+    motion_features="xyhs",
     log_gate_stats=False,
     show_progress=True,
 ):
@@ -682,6 +703,7 @@ def evaluate(
         trajectories_norm, future_traj_norm, kg_data, _ = normalize_batch_for_digir(
             trajectories, future_traj, kg_data, vehicle_masks, mode=coord_frame
         )
+        trajectories_norm = apply_motion_feature_ablation(trajectories_norm, motion_features)
         # Diffusion / generate 目标为「相对当前观测末帧的位移」，与 per_agent 尺度一致；地图仍用 scene 对齐。
         last_pos_global = torch.nan_to_num(
             trajectories[:, :, -1:, :2].clone(), nan=0.0, posinf=0.0, neginf=0.0
@@ -873,6 +895,7 @@ def train_epoch(
     optimizer,
     device,
     coord_frame=COORD_PER_AGENT,
+    motion_features="xyhs",
     log_gate_stats=False,
     show_progress=True,
 ):
@@ -906,6 +929,7 @@ def train_epoch(
         trajectories_norm, future_traj_norm, kg_data, _ = normalize_batch_for_digir(
             trajectories, future_traj, kg_data, vehicle_masks, mode=coord_frame
         )
+        trajectories_norm = apply_motion_feature_ablation(trajectories_norm, motion_features)
         if printed_nan < 1 and (not torch.isfinite(trajectories_norm).all() or not torch.isfinite(future_traj_norm).all()):
             printed_nan += 1
             print("[NaN/Inf] found in input normalization; applying nan_to_num")
@@ -1044,6 +1068,14 @@ def main():
         help="Enable DataLoader pin_memory. Default is off for compatibility with expanded-view tensors.",
     )
     parser.add_argument("--batch_by_location", action="store_true", help="Scheme 2A: group batches by location_name")
+    parser.add_argument(
+        "--motion_features",
+        type=str,
+        default="xyhs",
+        choices=["xyhs", "xy"],
+        help="Historical vehicle-state channels visible to the model. "
+        "xyhs uses [x,y,heading,speed]; xy masks heading/speed to zero for x,y+map-only experiments.",
+    )
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--train_subset", type=int, default=5000)
@@ -1218,6 +1250,7 @@ def main():
             f"lambda_coarse={config['lambda_coarse']:.3g}, lambda_cross={config['lambda_cross']:.3g}"
         )
         mprint(f"Coordinate frame: {args.coord_frame}")
+        mprint(f"Motion features: {args.motion_features}")
         mprint(f"DataLoader workers: {int(args.num_workers)}, pin_memory: {bool(args.pin_memory)}")
         mprint(f"Ablate cross-attn: {args.ablate_cross_attn}")
         mprint(f"Ablate gate: {args.ablate_gate}")
@@ -1480,6 +1513,7 @@ def main():
                 optimizer,
                 device,
                 coord_frame=args.coord_frame,
+                motion_features=args.motion_features,
                 log_gate_stats=args.log_gate_stats,
                 show_progress=is_main,
             )
@@ -1511,6 +1545,7 @@ def main():
                 sample_step=args.sample_step,
                 max_batches=args.eval_batches,
                 coord_frame=args.coord_frame,
+                motion_features=args.motion_features,
                 log_gate_stats=args.log_gate_stats,
                 show_progress=is_main,
             )
