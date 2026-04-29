@@ -708,6 +708,10 @@ def evaluate(
         last_pos_global = torch.nan_to_num(
             trajectories[:, :, -1:, :2].clone(), nan=0.0, posinf=0.0, neginf=0.0
         )
+        if coord_frame == COORD_PER_AGENT:
+            kg_data["agent_anchor_points"] = last_pos_global.squeeze(2)
+        else:
+            kg_data["agent_anchor_points"] = trajectories_norm[:, :, -1, :2]
         future_local = torch.nan_to_num(
             future_local_from_normed(future_traj_norm, trajectories_norm),
             nan=0.0,
@@ -937,6 +941,10 @@ def train_epoch(
         last_pos_global = torch.nan_to_num(
             trajectories[:, :, -1:, :2].clone(), nan=0.0, posinf=0.0, neginf=0.0
         )
+        if coord_frame == COORD_PER_AGENT:
+            kg_data["agent_anchor_points"] = last_pos_global.squeeze(2)
+        else:
+            kg_data["agent_anchor_points"] = trajectories_norm[:, :, -1, :2]
         future_local = torch.nan_to_num(
             future_local_from_normed(future_traj_norm, trajectories_norm),
             nan=0.0,
@@ -1113,6 +1121,24 @@ def main():
     parser.add_argument("--lambda_cross", type=float, default=0.1, help="Weight for cross-granularity KL loss (L_cross).")
     parser.add_argument("--map_margin", type=float, default=3.0, help="Meters. L_map penalizes distance beyond this.")
     parser.add_argument(
+        "--geo_corridor_embed_weight",
+        type=float,
+        default=1.0,
+        help="Geometry-aware corridor variants: weight for embedding similarity in KG node selection.",
+    )
+    parser.add_argument(
+        "--geo_corridor_dist_weight",
+        type=float,
+        default=2.0,
+        help="Geometry-aware corridor variants: weight for geometric distance penalty in KG node selection.",
+    )
+    parser.add_argument(
+        "--geo_path_goal_weight",
+        type=float,
+        default=0.2,
+        help="Geometry-aware corridor variants: path-score penalty for selected goal-node distance.",
+    )
+    parser.add_argument(
         "--ablate_cross_attn",
         action="store_true",
         help="Ablation: disable trajectory<->map cross-attention (local_context <- motion_summaries).",
@@ -1222,6 +1248,9 @@ def main():
             'sample_step': max(1, int(args.sample_step)),
             # Map margin (meters) for L_map (distance to road segment beyond this is penalized)
             'map_margin': float(args.map_margin),
+            'geo_corridor_embed_weight': float(args.geo_corridor_embed_weight),
+            'geo_corridor_dist_weight': float(args.geo_corridor_dist_weight),
+            'geo_path_goal_weight': float(args.geo_path_goal_weight),
             'coord_frame': str(args.coord_frame),
             'ablate_cross_attn': bool(args.ablate_cross_attn),
             'ablate_gate': str(args.ablate_gate),
@@ -1248,6 +1277,10 @@ def main():
         mprint(
             f"Loss weights: lambda_rule={config['lambda_rule']:.3g}, "
             f"lambda_coarse={config['lambda_coarse']:.3g}, lambda_cross={config['lambda_cross']:.3g}"
+        )
+        mprint(
+            f"Geo corridor weights: embed={config['geo_corridor_embed_weight']:.3g}, "
+            f"dist={config['geo_corridor_dist_weight']:.3g}, path_goal={config['geo_path_goal_weight']:.3g}"
         )
         mprint(f"Coordinate frame: {args.coord_frame}")
         mprint(f"Motion features: {args.motion_features}")
