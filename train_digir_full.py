@@ -661,6 +661,34 @@ def evaluate(
             f"(dim={pred.dim()}). Expected (B,N,T,2) or with a singleton sample dim."
         )
 
+    def _normalize_pred_samples(pred: torch.Tensor, expected_k: int) -> torch.Tensor:
+        """
+        Normalize multi-sample output of model.generate to shape (K, B, N, T, 2).
+
+        Multi-modal decoders can return scored top-K trajectories in one call when
+        bestof=True. Older/single-sample generators may still return (B,N,T,2).
+        """
+        if pred.dim() == 4:
+            return pred.unsqueeze(0)
+
+        if pred.dim() == 5:
+            # Preferred convention: (K, B, N, T, 2)
+            if pred.shape[0] == expected_k:
+                return pred
+            # Some generators use (B, K, N, T, 2).
+            if pred.shape[1] == expected_k:
+                return pred.permute(1, 0, 2, 3, 4).contiguous()
+            # Singleton sample dimensions.
+            if pred.shape[0] == 1:
+                return pred
+            if pred.shape[1] == 1:
+                return pred.permute(1, 0, 2, 3, 4).contiguous()
+
+        raise RuntimeError(
+            f"Unexpected pred shape from top-K generate: {tuple(pred.shape)} "
+            f"(dim={pred.dim()}). Expected (K,B,N,T,2), (B,K,N,T,2), or (B,N,T,2)."
+        )
+
     # max_batches <= 0 means evaluate the full dataloader.
     # In distributed eval, dataloader is already sharded.
     if max_batches is not None and max_batches > 0:
@@ -729,20 +757,37 @@ def evaluate(
         # Keep generation horizon consistent with current dataset target length.
         # This is required for configs like h10/f30 (1s->3s) where T != 12.
         pred_horizon = int(future_local.shape[2])
-        pred_trajs_k = []
-        for _ in range(num_samples):
+        eval_k = max(1, int(num_samples))
+        try:
             pred = base_model.generate(
                 trajectories_norm, kg_data,
                 num_points=pred_horizon,
-                num_samples=1,
+                num_samples=eval_k,
                 sampling="ddim",
                 step=max(1, int(sample_step)),
-                bestof=False,
+                bestof=True,
                 vehicle_masks=vehicle_masks,
             )
-            pred_trajs_k.append(_normalize_pred_shape(pred))
+            pred_trajs_k = _normalize_pred_samples(pred, expected_k=eval_k)
+        except Exception as exc:
+            # Backward-compatible fallback for older diffusion-style generators that
+            # cannot emit top-K in a single call.
+            if batch_count == 1:
+                print(f"[Eval] top-K generate failed ({exc}); falling back to repeated sampling.")
+            pred_trajs = []
+            for _ in range(eval_k):
+                pred = base_model.generate(
+                    trajectories_norm, kg_data,
+                    num_points=pred_horizon,
+                    num_samples=1,
+                    sampling="ddim",
+                    step=max(1, int(sample_step)),
+                    bestof=False,
+                    vehicle_masks=vehicle_masks,
+                )
+                pred_trajs.append(_normalize_pred_shape(pred))
+            pred_trajs_k = torch.stack(pred_trajs, dim=0)  # (K, B, N, T, 2)
 
-        pred_trajs_k = torch.stack(pred_trajs_k, dim=0)  # (K, B, N, T, 2) or similar
         pred_trajs_k = torch.nan_to_num(pred_trajs_k, nan=0.0, posinf=0.0, neginf=0.0)
 
         # Compare pred vs GT in the same frame as training (local / displacement).
