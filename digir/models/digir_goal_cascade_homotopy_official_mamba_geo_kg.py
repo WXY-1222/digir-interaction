@@ -270,6 +270,7 @@ class DIGIR(OfficialMambaHomotopyDIGIR):
 
         step_delta = self.step_delta_head(seq).view(b, n, k_target, t, 2)
         traj_modes = torch.cumsum(step_delta, dim=-2)
+        traj_modes = self._apply_cv_residual(traj_modes)
 
         goal_expand = mode_goals.unsqueeze(-2)
         alpha = torch.linspace(0.0, 1.0, t, device=traj_modes.device, dtype=traj_modes.dtype).view(1, 1, 1, t, 1)

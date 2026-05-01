@@ -1164,6 +1164,29 @@ def main():
     parser.add_argument("--lambda_rule", type=float, default=1e-3, help="Weight for (L_col + L_map). Set 0 for baseline.")
     parser.add_argument("--lambda_coarse", type=float, default=0.5, help="Weight for intent classification loss (L_coarse).")
     parser.add_argument("--lambda_cross", type=float, default=0.1, help="Weight for cross-granularity KL loss (L_cross).")
+    parser.add_argument(
+        "--lambda_interaction_graph",
+        type=float,
+        default=0.0,
+        help="Weight for directed pairwise interaction graph auxiliary loss. Set >0 to enable.",
+    )
+    parser.add_argument(
+        "--interaction_dist_threshold",
+        type=float,
+        default=2.5,
+        help="Meters. Close-approach threshold used to build pairwise interaction pseudo-labels.",
+    )
+    parser.add_argument(
+        "--disable_cv_residual",
+        action="store_true",
+        help="Disable constant-velocity residual anchoring in deterministic route proposals.",
+    )
+    parser.add_argument(
+        "--cv_residual_weight",
+        type=float,
+        default=1.0,
+        help="Weight applied to the constant-velocity residual prior.",
+    )
     parser.add_argument("--map_margin", type=float, default=3.0, help="Meters. L_map penalizes distance beyond this.")
     parser.add_argument(
         "--geo_corridor_embed_weight",
@@ -1287,6 +1310,10 @@ def main():
             'lambda_fine': 1.0,
             'lambda_coarse': float(args.lambda_coarse),
             'lambda_cross': float(args.lambda_cross),
+            'lambda_interaction_graph': float(args.lambda_interaction_graph),
+            'interaction_dist_threshold': float(args.interaction_dist_threshold),
+            'use_cv_residual': not bool(args.disable_cv_residual),
+            'cv_residual_weight': float(args.cv_residual_weight),
             # Rule loss weight (L_col + L_map). Distances are in meters.
             'lambda_rule': float(args.lambda_rule),
             # Diffusion sample stride used in eval generation and rule-loss sampling.
@@ -1321,7 +1348,13 @@ def main():
         )
         mprint(
             f"Loss weights: lambda_rule={config['lambda_rule']:.3g}, "
-            f"lambda_coarse={config['lambda_coarse']:.3g}, lambda_cross={config['lambda_cross']:.3g}"
+            f"lambda_coarse={config['lambda_coarse']:.3g}, lambda_cross={config['lambda_cross']:.3g}, "
+            f"lambda_interaction_graph={config['lambda_interaction_graph']:.3g}"
+        )
+        mprint(
+            f"Proposal priors: cv_residual={config['use_cv_residual']}, "
+            f"cv_weight={config['cv_residual_weight']:.3g}, "
+            f"interaction_dist_threshold={config['interaction_dist_threshold']:.3g}"
         )
         mprint(
             f"Geo corridor weights: embed={config['geo_corridor_embed_weight']:.3g}, "
@@ -1532,7 +1565,15 @@ def main():
                 raise FileNotFoundError(f"Resume checkpoint not found: {args.resume}")
             checkpoint = torch.load(args.resume, map_location=device)
             model_state = checkpoint.get("model", checkpoint)
-            unwrap_model(model).load_state_dict(model_state)
+            missing_keys, unexpected_keys = unwrap_model(model).load_state_dict(model_state, strict=False)
+            if missing_keys:
+                preview = ", ".join(missing_keys[:8])
+                suffix = "..." if len(missing_keys) > 8 else ""
+                mprint(f"  [!] Resume missing model keys initialized from scratch: {preview}{suffix}")
+            if unexpected_keys:
+                preview = ", ".join(unexpected_keys[:8])
+                suffix = "..." if len(unexpected_keys) > 8 else ""
+                mprint(f"  [!] Resume ignored unexpected model keys: {preview}{suffix}")
             if "optimizer" in checkpoint:
                 optimizer.load_state_dict(checkpoint["optimizer"])
             else:

@@ -22,6 +22,43 @@ import torch.nn.functional as F
 from models.digir_goal_cascade_spatial_temporal_ssm import DIGIR as SpatialTemporalSSM
 
 
+class DirectedPairInteractionHead(nn.Module):
+    """
+    Predict directed pairwise interaction order for each agent pair.
+
+    Classes for pair (i, j):
+        0: no close interaction
+        1: agent i reaches the conflict region before agent j
+        2: agent j reaches the conflict region before agent i
+    """
+
+    def __init__(self, d_model: int, dropout: float = 0.1):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(d_model * 3 + 3, d_model),
+            nn.GELU(),
+            nn.Dropout(float(dropout)),
+            nn.Linear(d_model, d_model // 2),
+            nn.GELU(),
+            nn.Linear(d_model // 2, 3),
+        )
+
+    def forward(self, agent_features, agent_positions, vehicle_masks=None):
+        b, n, d = agent_features.shape
+        hi = agent_features.unsqueeze(2).expand(b, n, n, d)
+        hj = agent_features.unsqueeze(1).expand(b, n, n, d)
+        rel = agent_positions.unsqueeze(2) - agent_positions.unsqueeze(1)
+        dist = torch.norm(rel, dim=-1, keepdim=True)
+        feat = torch.cat([hi, hj, hi - hj, rel, dist], dim=-1)
+        logits = self.mlp(feat)
+
+        if vehicle_masks is not None:
+            valid = vehicle_masks.bool()
+            pair_valid = valid.unsqueeze(2) & valid.unsqueeze(1)
+            logits = logits.masked_fill(~pair_valid.unsqueeze(-1), 0.0)
+        return logits
+
+
 class DIGIR(SpatialTemporalSSM):
     """
     Spatial-temporal SSM with homotopy-class multi-path unrolling.
@@ -36,8 +73,91 @@ class DIGIR(SpatialTemporalSSM):
         self.homotopy_score_weight = float(config.get("homotopy_score_weight", 0.2))
         self.lambda_homotopy = float(config.get("lambda_homotopy", 0.1))
         self.homotopy_margin = float(config.get("homotopy_margin", 0.6))
+        self.lambda_interaction_graph = float(config.get("lambda_interaction_graph", 0.0))
+        self.interaction_dist_threshold = float(config.get("interaction_dist_threshold", 2.5))
+        self.use_cv_residual = bool(config.get("use_cv_residual", True))
+        self.cv_residual_weight = float(config.get("cv_residual_weight", 1.0))
+        self._cv_prior = None
 
         self.homotopy_embed = nn.Embedding(self.homotopy_classes, self.d_model)
+        self.pair_interaction_head = DirectedPairInteractionHead(
+            d_model=self.d_model,
+            dropout=float(config.get("dropout", 0.1)),
+        )
+
+    def _current_pair_positions(self, trajectories, kg_data):
+        anchor = kg_data.get("agent_anchor_points", None) if isinstance(kg_data, dict) else None
+        if anchor is not None:
+            return anchor[..., :2].to(device=trajectories.device, dtype=trajectories.dtype)
+        return trajectories[:, :, -1, :2]
+
+    def _build_constant_velocity_prior(self, trajectories, num_points: int):
+        if not self.use_cv_residual:
+            return None
+        b, n, hist, _ = trajectories.shape
+        t = int(num_points)
+        if hist < 2 or t <= 0:
+            return torch.zeros((b, n, max(t, 0), 2), device=trajectories.device, dtype=trajectories.dtype)
+
+        velocity = trajectories[:, :, -1, :2] - trajectories[:, :, -2, :2]
+        steps = torch.arange(1, t + 1, device=trajectories.device, dtype=trajectories.dtype)
+        return steps.view(1, 1, t, 1) * velocity.unsqueeze(2)
+
+    def _apply_cv_residual(self, traj_modes):
+        cv_prior = getattr(self, "_cv_prior", None)
+        if cv_prior is None or not self.use_cv_residual:
+            return traj_modes
+        if cv_prior.shape[:2] != traj_modes.shape[:2] or cv_prior.shape[2] != traj_modes.shape[3]:
+            return traj_modes
+        return traj_modes + self.cv_residual_weight * cv_prior.unsqueeze(2).to(
+            device=traj_modes.device,
+            dtype=traj_modes.dtype,
+        )
+
+    def _build_pair_interaction_targets(self, future_traj, current_positions, vehicle_masks=None):
+        b, n, t, _ = future_traj.shape
+        device = future_traj.device
+        dtype = future_traj.dtype
+        if self.config.get("coord_frame", "global") == "per_agent":
+            future_global = future_traj + current_positions.unsqueeze(2).to(device=device, dtype=dtype)
+        else:
+            future_global = future_traj
+
+        fi = future_global.unsqueeze(2).unsqueeze(4)
+        fj = future_global.unsqueeze(1).unsqueeze(3)
+        dist = torch.norm(fi - fj, dim=-1)
+        flat_dist = dist.view(b, n, n, t * t)
+        min_dist, flat_idx = flat_dist.min(dim=-1)
+        ti = torch.div(flat_idx, t, rounding_mode="floor")
+        tj = flat_idx.remainder(t)
+
+        labels = torch.zeros((b, n, n), device=device, dtype=torch.long)
+        close = min_dist < float(self.interaction_dist_threshold)
+        labels[(close) & (ti < tj)] = 1
+        labels[(close) & (ti > tj)] = 2
+
+        if t > 1:
+            speed = torch.norm(future_global[:, :, 1:] - future_global[:, :, :-1], dim=-1).mean(dim=-1)
+            faster_i = speed.unsqueeze(2) >= speed.unsqueeze(1)
+            labels[(close) & (ti == tj) & faster_i] = 1
+            labels[(close) & (ti == tj) & (~faster_i)] = 2
+
+        valid = torch.ones((b, n), dtype=torch.bool, device=device) if vehicle_masks is None else vehicle_masks.bool()
+        pair_mask = valid.unsqueeze(2) & valid.unsqueeze(1)
+        diag = torch.eye(n, dtype=torch.bool, device=device).view(1, n, n)
+        pair_mask = pair_mask & (~diag)
+        return labels, pair_mask
+
+    def _pair_interaction_loss(self, pair_logits, future_traj, current_positions, vehicle_masks=None):
+        labels, pair_mask = self._build_pair_interaction_targets(
+            future_traj=future_traj,
+            current_positions=current_positions,
+            vehicle_masks=vehicle_masks,
+        )
+        if not pair_mask.any():
+            return torch.tensor(0.0, device=future_traj.device, dtype=future_traj.dtype), labels, pair_mask
+        loss = F.cross_entropy(pair_logits[pair_mask], labels[pair_mask], reduction="mean")
+        return loss, labels, pair_mask
 
     @staticmethod
     def _dijkstra_with_penalty(
@@ -336,6 +456,7 @@ class DIGIR(SpatialTemporalSSM):
 
         step_delta = self.step_delta_head(seq).view(b, n, k_target, t, 2)
         traj_modes = torch.cumsum(step_delta, dim=-2)
+        traj_modes = self._apply_cv_residual(traj_modes)
 
         goal_expand = mode_goals.unsqueeze(-2)
         alpha = torch.linspace(
@@ -356,6 +477,13 @@ class DIGIR(SpatialTemporalSSM):
 
     def forward(self, trajectories, kg_data, future_traj=None, mode="train", vehicle_masks=None):
         outputs = self._build_backbone(trajectories, kg_data, vehicle_masks=vehicle_masks)
+        current_positions = self._current_pair_positions(trajectories, kg_data)
+        pair_logits = self.pair_interaction_head(
+            outputs["interaction_features"],
+            current_positions,
+            vehicle_masks=vehicle_masks,
+        )
+        outputs["pair_interaction_logits"] = pair_logits
         goal_h, goal_xy, goal_logits = self._goal_decode_with_state(
             outputs["fused_conditions"],
             outputs["local_contexts"],
@@ -366,6 +494,7 @@ class DIGIR(SpatialTemporalSSM):
 
         if mode == "train" and future_traj is not None:
             b, n, t, _ = future_traj.shape
+            self._cv_prior = self._build_constant_velocity_prior(trajectories, num_points=t)
             (
                 traj_modes,
                 mode_logits,
@@ -428,6 +557,18 @@ class DIGIR(SpatialTemporalSSM):
                 corr_align = z
                 homotopy_loss = z
 
+            if self.lambda_interaction_graph > 0.0:
+                interaction_graph_loss, pair_labels, pair_mask = self._pair_interaction_loss(
+                    pair_logits=pair_logits,
+                    future_traj=future_traj,
+                    current_positions=current_positions,
+                    vehicle_masks=vehicle_masks,
+                )
+                outputs["pair_interaction_labels"] = pair_labels
+                outputs["pair_interaction_mask"] = pair_mask
+            else:
+                interaction_graph_loss = torch.tensor(0.0, device=future_traj.device, dtype=future_traj.dtype)
+
             total = (
                 traj_loss
                 + self.lambda_goal * goal_loss
@@ -435,6 +576,7 @@ class DIGIR(SpatialTemporalSSM):
                 + self.lambda_temporal_smooth * smooth_loss
                 + self.lambda_corridor * corr_align
                 + self.lambda_homotopy * homotopy_loss
+                + self.lambda_interaction_graph * interaction_graph_loss
             )
             outputs["diffusion_loss"] = total
             outputs["loss_route_head"] = traj_loss
@@ -443,6 +585,7 @@ class DIGIR(SpatialTemporalSSM):
             outputs["loss_temporal_smooth"] = smooth_loss
             outputs["loss_corridor_align"] = corr_align
             outputs["loss_homotopy"] = homotopy_loss
+            outputs["loss_interaction_graph"] = interaction_graph_loss
 
         return outputs
 
@@ -460,6 +603,7 @@ class DIGIR(SpatialTemporalSSM):
         del sampling, step
 
         outputs = self._build_backbone(trajectories, kg_data, vehicle_masks=vehicle_masks)
+        self._cv_prior = self._build_constant_velocity_prior(trajectories, num_points=int(num_points))
         goal_h, goal_xy, goal_logits = self._goal_decode_with_state(
             outputs["fused_conditions"],
             outputs["local_contexts"],
@@ -505,3 +649,24 @@ class DIGIR(SpatialTemporalSSM):
             preds.append(self._gather_mode(traj_modes, idx))
         return torch.stack(preds, dim=0)
 
+    def compute_losses(self, outputs, future_traj, intent_labels, vehicle_masks=None):
+        losses, total_loss = super().compute_losses(
+            outputs,
+            future_traj,
+            intent_labels,
+            vehicle_masks=vehicle_masks,
+        )
+        for key in (
+            "loss_route_head",
+            "loss_goal_head",
+            "loss_mode_cls",
+            "loss_temporal_smooth",
+            "loss_corridor_align",
+            "loss_homotopy",
+            "loss_interaction_graph",
+        ):
+            if key in outputs:
+                losses[key] = float(outputs[key].detach().item())
+        losses["lambda_interaction_graph"] = float(self.lambda_interaction_graph)
+        losses["use_cv_residual"] = float(self.use_cv_residual)
+        return losses, total_loss
