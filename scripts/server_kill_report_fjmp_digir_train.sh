@@ -2,6 +2,7 @@
 set -euo pipefail
 
 PYTHON_BIN="${PYTHON_BIN:-/home/bitwxy/miniconda3/envs/wxy/bin/python}"
+TORCHRUN_BIN="${TORCHRUN_BIN:-/home/bitwxy/miniconda3/envs/wxy/bin/torchrun}"
 PROJECT_ROOT="${PROJECT_ROOT:-/home/bitwxy/interaction}"
 FJMP_CODE_ROOT="${FJMP_CODE_ROOT:-/data/sdb/bitwxy/baselines/FJMP}"
 RAW_ROOT="${RAW_ROOT:-/data/sdb/bitwxy/interaction_raw}"
@@ -113,7 +114,7 @@ echo
 echo "== Start DIGIR training on FJMP-converted data =="
 mkdir -p "${RUN_ROOT}"
 TRAIN_LOG="${RUN_ROOT}/homotopy_official_mamba_geo_kg_fjmp_h10_f30_bs4_k6.log"
-nohup torchrun --standalone --nproc_per_node=8 train_digir_full_goal_cascade_homotopy_official_mamba_geo_kg.py \
+nohup "${TORCHRUN_BIN}" --standalone --nproc_per_node=8 train_digir_full_goal_cascade_homotopy_official_mamba_geo_kg.py \
   --data_root "${DATA_ROOT}" \
   --save_root "${RUN_ROOT}" \
   --data "$(basename "${FJMP_DIGIR_DATA}")" \
