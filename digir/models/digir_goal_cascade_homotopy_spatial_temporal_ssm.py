@@ -71,12 +71,17 @@ class InteractionSpatialModulator(nn.Module):
     def __init__(self, d_model: int, dropout: float = 0.1, scale: float = 0.2):
         super().__init__()
         self.scale = float(scale)
+        self.out = nn.Linear(d_model, d_model * 2 + 1)
+        nn.init.zeros_(self.out.weight)
+        nn.init.zeros_(self.out.bias)
+        with torch.no_grad():
+            self.out.bias[-1].fill_(-4.0)
         self.film = nn.Sequential(
             nn.LayerNorm(d_model * 3),
             nn.Linear(d_model * 3, d_model),
             nn.GELU(),
             nn.Dropout(float(dropout)),
-            nn.Linear(d_model, d_model * 2 + 1),
+            self.out,
         )
 
     def forward(self, spatial_state, route_goal, social_context):
