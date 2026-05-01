@@ -1187,6 +1187,17 @@ def main():
         default=1.0,
         help="Weight applied to the constant-velocity residual prior.",
     )
+    parser.add_argument(
+        "--disable_interaction_spatial_modulation",
+        action="store_true",
+        help="Disable interaction-aware FiLM modulation of homotopy spatial states.",
+    )
+    parser.add_argument(
+        "--interaction_modulation_scale",
+        type=float,
+        default=0.2,
+        help="Scale for interaction-aware spatial-state modulation.",
+    )
     parser.add_argument("--map_margin", type=float, default=3.0, help="Meters. L_map penalizes distance beyond this.")
     parser.add_argument(
         "--geo_corridor_embed_weight",
@@ -1314,6 +1325,8 @@ def main():
             'interaction_dist_threshold': float(args.interaction_dist_threshold),
             'use_cv_residual': not bool(args.disable_cv_residual),
             'cv_residual_weight': float(args.cv_residual_weight),
+            'use_interaction_spatial_modulation': not bool(args.disable_interaction_spatial_modulation),
+            'interaction_modulation_scale': float(args.interaction_modulation_scale),
             # Rule loss weight (L_col + L_map). Distances are in meters.
             'lambda_rule': float(args.lambda_rule),
             # Diffusion sample stride used in eval generation and rule-loss sampling.
@@ -1355,6 +1368,10 @@ def main():
             f"Proposal priors: cv_residual={config['use_cv_residual']}, "
             f"cv_weight={config['cv_residual_weight']:.3g}, "
             f"interaction_dist_threshold={config['interaction_dist_threshold']:.3g}"
+        )
+        mprint(
+            f"Interaction spatial modulation: enabled={config['use_interaction_spatial_modulation']}, "
+            f"scale={config['interaction_modulation_scale']:.3g}"
         )
         mprint(
             f"Geo corridor weights: embed={config['geo_corridor_embed_weight']:.3g}, "

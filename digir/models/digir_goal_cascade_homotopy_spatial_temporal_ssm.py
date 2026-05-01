@@ -59,6 +59,36 @@ class DirectedPairInteractionHead(nn.Module):
         return logits
 
 
+class InteractionSpatialModulator(nn.Module):
+    """
+    Inject social interaction context into each homotopy corridor state.
+
+    The modulator is intentionally light: pairwise interaction predictions are
+    first pooled into a per-agent social context, then this context FiLM-modulates
+    every route-mode spatial state before the Temporal SSM rollout.
+    """
+
+    def __init__(self, d_model: int, dropout: float = 0.1, scale: float = 0.2):
+        super().__init__()
+        self.scale = float(scale)
+        self.film = nn.Sequential(
+            nn.LayerNorm(d_model * 3),
+            nn.Linear(d_model * 3, d_model),
+            nn.GELU(),
+            nn.Dropout(float(dropout)),
+            nn.Linear(d_model, d_model * 2 + 1),
+        )
+
+    def forward(self, spatial_state, route_goal, social_context):
+        b, n, k, d = spatial_state.shape
+        social = social_context.unsqueeze(2).expand(b, n, k, d)
+        params = self.film(torch.cat([spatial_state, route_goal, social], dim=-1))
+        gamma, beta, gate_logits = torch.split(params, [d, d, 1], dim=-1)
+        gate = torch.sigmoid(gate_logits)
+        delta = torch.tanh(gamma) * spatial_state + beta
+        return spatial_state + self.scale * gate * delta
+
+
 class DIGIR(SpatialTemporalSSM):
     """
     Spatial-temporal SSM with homotopy-class multi-path unrolling.
@@ -77,12 +107,22 @@ class DIGIR(SpatialTemporalSSM):
         self.interaction_dist_threshold = float(config.get("interaction_dist_threshold", 2.5))
         self.use_cv_residual = bool(config.get("use_cv_residual", True))
         self.cv_residual_weight = float(config.get("cv_residual_weight", 1.0))
+        self.use_interaction_spatial_modulation = bool(
+            config.get("use_interaction_spatial_modulation", True)
+        )
+        self.interaction_modulation_scale = float(config.get("interaction_modulation_scale", 0.2))
         self._cv_prior = None
+        self._social_context = None
 
         self.homotopy_embed = nn.Embedding(self.homotopy_classes, self.d_model)
         self.pair_interaction_head = DirectedPairInteractionHead(
             d_model=self.d_model,
             dropout=float(config.get("dropout", 0.1)),
+        )
+        self.interaction_spatial_modulator = InteractionSpatialModulator(
+            d_model=self.d_model,
+            dropout=float(config.get("dropout", 0.1)),
+            scale=self.interaction_modulation_scale,
         )
 
     def _current_pair_positions(self, trajectories, kg_data):
@@ -112,6 +152,39 @@ class DIGIR(SpatialTemporalSSM):
         return traj_modes + self.cv_residual_weight * cv_prior.unsqueeze(2).to(
             device=traj_modes.device,
             dtype=traj_modes.dtype,
+        )
+
+    def _build_social_context(self, interaction_features, pair_logits, vehicle_masks=None):
+        probs = F.softmax(pair_logits, dim=-1)
+        interact_prob = 1.0 - probs[..., 0]
+        signed_yield = probs[..., 2] - probs[..., 1]
+        weights = interact_prob * (1.0 + 0.5 * signed_yield).clamp(min=0.1, max=1.9)
+
+        b, n, d = interaction_features.shape
+        eye = torch.eye(n, dtype=torch.bool, device=interaction_features.device).view(1, n, n)
+        weights = weights.masked_fill(eye, 0.0)
+
+        if vehicle_masks is not None:
+            valid = vehicle_masks.bool()
+            pair_valid = valid.unsqueeze(2) & valid.unsqueeze(1)
+            weights = weights.masked_fill(~pair_valid, 0.0)
+
+        neigh_feat = interaction_features.unsqueeze(1).expand(b, n, n, d)
+        denom = weights.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+        return (weights.unsqueeze(-1) * neigh_feat).sum(dim=2) / denom
+
+    def _apply_interaction_spatial_modulation(self, spatial_state, route_goal):
+        if not self.use_interaction_spatial_modulation:
+            return spatial_state
+        social_context = getattr(self, "_social_context", None)
+        if social_context is None:
+            return spatial_state
+        if social_context.shape[:2] != spatial_state.shape[:2]:
+            return spatial_state
+        return self.interaction_spatial_modulator(
+            spatial_state,
+            route_goal,
+            social_context.to(device=spatial_state.device, dtype=spatial_state.dtype),
         )
 
     def _build_pair_interaction_targets(self, future_traj, current_positions, vehicle_masks=None):
@@ -431,6 +504,7 @@ class DIGIR(SpatialTemporalSSM):
         base_seed = route_goal + 0.5 * intent_priors.unsqueeze(2) + 0.5 * interaction_features.unsqueeze(2)
 
         spatial_state, _ = self._spatial_scan(mode_seq, base_seed)
+        spatial_state = self._apply_interaction_spatial_modulation(spatial_state, route_goal)
         route_base = self.route_seed_proj(
             torch.cat(
                 [
@@ -484,6 +558,12 @@ class DIGIR(SpatialTemporalSSM):
             vehicle_masks=vehicle_masks,
         )
         outputs["pair_interaction_logits"] = pair_logits
+        self._social_context = self._build_social_context(
+            outputs["interaction_features"],
+            pair_logits,
+            vehicle_masks=vehicle_masks,
+        )
+        outputs["social_context"] = self._social_context
         goal_h, goal_xy, goal_logits = self._goal_decode_with_state(
             outputs["fused_conditions"],
             outputs["local_contexts"],
@@ -604,6 +684,17 @@ class DIGIR(SpatialTemporalSSM):
 
         outputs = self._build_backbone(trajectories, kg_data, vehicle_masks=vehicle_masks)
         self._cv_prior = self._build_constant_velocity_prior(trajectories, num_points=int(num_points))
+        current_positions = self._current_pair_positions(trajectories, kg_data)
+        pair_logits = self.pair_interaction_head(
+            outputs["interaction_features"],
+            current_positions,
+            vehicle_masks=vehicle_masks,
+        )
+        self._social_context = self._build_social_context(
+            outputs["interaction_features"],
+            pair_logits,
+            vehicle_masks=vehicle_masks,
+        )
         goal_h, goal_xy, goal_logits = self._goal_decode_with_state(
             outputs["fused_conditions"],
             outputs["local_contexts"],
@@ -669,4 +760,5 @@ class DIGIR(SpatialTemporalSSM):
                 losses[key] = float(outputs[key].detach().item())
         losses["lambda_interaction_graph"] = float(self.lambda_interaction_graph)
         losses["use_cv_residual"] = float(self.use_cv_residual)
+        losses["use_interaction_spatial_modulation"] = float(self.use_interaction_spatial_modulation)
         return losses, total_loss

@@ -245,6 +245,7 @@ class DIGIR(OfficialMambaHomotopyDIGIR):
         base_seed = route_goal + 0.5 * intent_priors.unsqueeze(2) + 0.5 * interaction_features.unsqueeze(2)
 
         spatial_state, _ = self._spatial_scan(mode_seq, base_seed)
+        spatial_state = self._apply_interaction_spatial_modulation(spatial_state, route_goal)
         route_base = self.route_seed_proj(
             torch.cat(
                 [
