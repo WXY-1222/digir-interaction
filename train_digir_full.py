@@ -1155,6 +1155,30 @@ def main():
     )
     parser.add_argument("--k", type=int, default=5)
     parser.add_argument(
+        "--route_modes",
+        type=int,
+        default=0,
+        help="Internal proposal/mode count for deterministic cascade decoders. "
+        "When >0, the model can train over more proposals than the evaluated top-k.",
+    )
+    parser.add_argument(
+        "--enable_anchor_proposals",
+        action="store_true",
+        help="Enable learnable trajectory-anchor proposal priors in compatible deterministic decoders.",
+    )
+    parser.add_argument(
+        "--anchor_traj_weight",
+        type=float,
+        default=0.35,
+        help="Weight for adding learned trajectory-anchor templates before endpoint projection.",
+    )
+    parser.add_argument(
+        "--anchor_score_weight",
+        type=float,
+        default=0.5,
+        help="Weight for the anchor/proposal scoring MLP contribution to mode logits.",
+    )
+    parser.add_argument(
         "--sample_step",
         type=int,
         default=10,
@@ -1321,6 +1345,10 @@ def main():
             'lambda_fine': 1.0,
             'lambda_coarse': float(args.lambda_coarse),
             'lambda_cross': float(args.lambda_cross),
+            'route_modes': int(args.route_modes) if int(args.route_modes) > 0 else max(int(args.k), 6),
+            'use_anchor_proposals': bool(args.enable_anchor_proposals),
+            'anchor_traj_weight': float(args.anchor_traj_weight),
+            'anchor_score_weight': float(args.anchor_score_weight),
             'lambda_interaction_graph': float(args.lambda_interaction_graph),
             'interaction_dist_threshold': float(args.interaction_dist_threshold),
             'use_cv_residual': not bool(args.disable_cv_residual),
@@ -1358,6 +1386,12 @@ def main():
         mprint(
             f"Model config: d_model={config['d_model']}, diffusion_steps={config['diffusion_steps']}, "
             f"sample_step={config['sample_step']}"
+        )
+        mprint(
+            f"Route proposals: route_modes={config['route_modes']}, eval_top_k={int(args.k)}, "
+            f"anchor_proposals={config['use_anchor_proposals']}, "
+            f"anchor_traj_weight={config['anchor_traj_weight']:.3g}, "
+            f"anchor_score_weight={config['anchor_score_weight']:.3g}"
         )
         mprint(
             f"Loss weights: lambda_rule={config['lambda_rule']:.3g}, "

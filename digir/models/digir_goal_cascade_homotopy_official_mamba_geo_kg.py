@@ -16,6 +16,7 @@ from __future__ import annotations
 import math
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 from models.digir_goal_cascade_homotopy_official_mamba import (
@@ -37,12 +38,73 @@ class DIGIR(OfficialMambaHomotopyDIGIR):
         self.geo_embed_weight = float(config.get("geo_corridor_embed_weight", 1.0))
         self.geo_dist_weight = float(config.get("geo_corridor_dist_weight", 2.0))
         self.geo_path_goal_weight = float(config.get("geo_path_goal_weight", 0.2))
+        self.use_anchor_proposals = bool(config.get("use_anchor_proposals", False))
+        self.anchor_traj_weight = float(config.get("anchor_traj_weight", 0.35))
+        self.anchor_score_weight = float(config.get("anchor_score_weight", 0.5))
+        self.anchor_horizon = int(config.get("prediction_horizon", 12))
+        self.anchor_mode_embed = nn.Embedding(self.route_modes, self.d_model)
+        self.anchor_score_head = nn.Sequential(
+            nn.LayerNorm(self.d_model * 3 + 2),
+            nn.Linear(self.d_model * 3 + 2, self.d_model),
+            nn.GELU(),
+            nn.Dropout(float(config.get("dropout", 0.1))),
+            nn.Linear(self.d_model, 1),
+        )
+        self.anchor_traj = nn.Parameter(self._init_anchor_trajectories(self.route_modes, self.anchor_horizon))
         self._agent_anchor_points = None
 
     def _build_backbone(self, trajectories, kg_data, vehicle_masks=None):
         outputs = super()._build_backbone(trajectories, kg_data, vehicle_masks=vehicle_masks)
         self._agent_anchor_points = kg_data.get("agent_anchor_points", None)
         return outputs
+
+    @staticmethod
+    def _init_anchor_trajectories(num_modes: int, horizon: int) -> torch.Tensor:
+        """
+        Lightweight proposal templates in local coordinates.
+
+        They start as diverse straight/curved motions and are learnable. The decoder
+        predicts residuals and endpoint projection still forces consistency with the
+        selected goal, so anchors act as proposal priors rather than hard outputs.
+        """
+        k = max(1, int(num_modes))
+        t = max(1, int(horizon))
+        time = torch.linspace(0.0, 1.0, steps=t)
+        anchors = torch.zeros(k, t, 2)
+        for i in range(k):
+            frac = 0.0 if k == 1 else (float(i) / float(k - 1))
+            angle = -0.85 + 1.70 * frac
+            speed = 0.25 + 1.25 * ((i % 4) + 1) / 4.0
+            curve = ((i % 5) - 2) * 0.10
+            direction = torch.tensor([math.cos(angle), math.sin(angle)])
+            lateral = torch.tensor([-math.sin(angle), math.cos(angle)])
+            anchors[i] = speed * time.unsqueeze(-1) * direction + curve * (time * time).unsqueeze(-1) * lateral
+        return anchors
+
+    def _anchor_templates(self, num_modes: int, num_points: int, device, dtype):
+        if not self.use_anchor_proposals:
+            return None
+        k = int(num_modes)
+        t = int(num_points)
+        anchors = self.anchor_traj[:k].to(device=device, dtype=dtype)
+        if anchors.shape[0] < k:
+            pad = anchors[-1:].expand(k - anchors.shape[0], -1, -1)
+            anchors = torch.cat([anchors, pad], dim=0)
+        if anchors.shape[1] != t:
+            anchors = F.interpolate(
+                anchors.permute(0, 2, 1),
+                size=t,
+                mode="linear",
+                align_corners=True,
+            ).permute(0, 2, 1)
+        return anchors
+
+    def _anchor_embeddings(self, num_modes: int, device):
+        ids = torch.arange(int(num_modes), device=device, dtype=torch.long)
+        if int(num_modes) <= self.anchor_mode_embed.num_embeddings:
+            return self.anchor_mode_embed(ids)
+        ids = ids.clamp_max(self.anchor_mode_embed.num_embeddings - 1)
+        return self.anchor_mode_embed(ids)
 
     @staticmethod
     def _safe_dist_scale(dist: torch.Tensor) -> torch.Tensor:
@@ -241,6 +303,9 @@ class DIGIR(OfficialMambaHomotopyDIGIR):
             torch.cat([fused_conditions.unsqueeze(2).expand(-1, -1, k_target, -1), mode_goals], dim=-1)
         )
         route_goal = route_goal + self.homotopy_embed(mode_hid)
+        if self.use_anchor_proposals:
+            anchor_embed = self._anchor_embeddings(k_target, route_goal.device).view(1, 1, k_target, d)
+            route_goal = route_goal + anchor_embed
         map_pool = graph_embeddings.mean(dim=1).unsqueeze(1).unsqueeze(2).expand(b, n, k_target, d)
         base_seed = route_goal + 0.5 * intent_priors.unsqueeze(2) + 0.5 * interaction_features.unsqueeze(2)
 
@@ -272,6 +337,9 @@ class DIGIR(OfficialMambaHomotopyDIGIR):
         step_delta = self.step_delta_head(seq).view(b, n, k_target, t, 2)
         traj_modes = torch.cumsum(step_delta, dim=-2)
         traj_modes = self._apply_cv_residual(traj_modes)
+        anchor_templates = self._anchor_templates(k_target, t, traj_modes.device, traj_modes.dtype)
+        if anchor_templates is not None:
+            traj_modes = traj_modes + self.anchor_traj_weight * anchor_templates.view(1, 1, k_target, t, 2)
 
         goal_expand = mode_goals.unsqueeze(-2)
         alpha = torch.linspace(0.0, 1.0, t, device=traj_modes.device, dtype=traj_modes.dtype).view(1, 1, 1, t, 1)
@@ -280,9 +348,15 @@ class DIGIR(OfficialMambaHomotopyDIGIR):
         final_state = seq[:, -1].view(b, n, k_target, d)
         route_logits = self.route_score_head(final_state).squeeze(-1)
         corridor_score = F.cosine_similarity(final_state, spatial_state, dim=-1)
+        if self.use_anchor_proposals:
+            score_feat = torch.cat([final_state, spatial_state, route_goal, mode_goals], dim=-1)
+            anchor_logits = self.anchor_score_head(score_feat).squeeze(-1)
+        else:
+            anchor_logits = torch.zeros_like(route_logits)
         mode_logits = (
             sel_goal_logits
             + route_logits
+            + self.anchor_score_weight * anchor_logits
             + self.homotopy_score_weight * sel_path_score
             + self.corridor_score_weight * corridor_score
         )
